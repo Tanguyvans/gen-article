@@ -1,3 +1,6 @@
+use langchain_rust::language_models::llm::LLM;
+use langchain_rust::llm::openai::OpenAI;
+use langchain_rust::llm::OpenAIConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,6 +25,17 @@ struct ProjectSettings {
 }
 
 type ProjectsMap = HashMap<String, ProjectSettings>;
+
+#[derive(Deserialize, Debug)]
+struct ArticleRequest {
+    topic: String,
+    description: String,
+}
+
+#[derive(Serialize, Debug)]
+struct ArticleResponse {
+    article_text: String,
+}
 
 #[tauri::command]
 async fn save_api_key(
@@ -211,6 +225,41 @@ async fn greet(app: tauri::AppHandle) -> String {
     }
 }
 
+#[tauri::command]
+async fn generate_article(
+    app: tauri::AppHandle,
+    request: ArticleRequest,
+) -> Result<ArticleResponse, String> {
+    let api_key = get_api_key(app.clone(), STORE_KEY_TEXT_API.to_string())
+        .await?
+        .ok_or_else(|| "Text Generation API Key not found in store.".to_string())?;
+
+    let open_ai = OpenAI::default().with_config(OpenAIConfig::default().with_api_key(api_key));
+
+    let user_prompt = format!(
+        "You are a helpful assistant that writes blog posts with image placeholders. \
+        Generate a blog post about the topic '{topic}'. \
+        The article should be described as: '{description}'. \
+        Please structure the article well with clear headings. \
+        Crucially, include placeholders for relevant images using the format [[Image of a descriptive caption]]. For example: [[Image of a futuristic cityscape]]. \
+        Ensure the placeholders are naturally integrated where an image would enhance the text.",
+        topic = request.topic,
+        description = request.description
+    );
+
+    println!("Sending prompt to LLM...");
+    let response = open_ai
+        .invoke(&user_prompt)
+        .await
+        .map_err(|e| format!("LLM invocation failed: {}", e))?;
+
+    println!("Received response from LLM.");
+
+    Ok(ArticleResponse {
+        article_text: response,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -224,7 +273,8 @@ pub fn run() {
             get_projects,
             get_project_settings,
             save_project_settings,
-            delete_project
+            delete_project,
+            generate_article
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
