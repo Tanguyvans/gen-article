@@ -474,43 +474,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
              <button onClick={onBack} disabled={isGenerating || isTestingImage}>&larr; Back to Projects</button>
         </div>
 
-        {/* --- Test Image Generation Section --- */}
-        <div className="card">
-             <h2>Test Image Generation (Ideogram)</h2>
-             <div className="row">
-                 <label htmlFor="test-image-prompt">Test Prompt:</label>
-                 <input
-                    id="test-image-prompt"
-                    type="text"
-                    value={testImagePrompt}
-                    onChange={(e) => setTestImagePrompt(e.target.value)}
-                    placeholder="e.g., A cat wearing a party hat"
-                    disabled={isTestingImage || isGenerating}
-                 />
-             </div>
-             <button onClick={handleTestImageGenerate} disabled={isTestingImage || isGenerating}>
-                 {isTestingImage ? "Requesting..." : "Generate Test Image"}
-             </button>
-             {/* Display Test Result */}
-             {testImageResult && (
-                 <div style={{ marginTop: '15px', borderTop: '1px solid #eee', paddingTop: '15px' }}>
-                     <strong>Result:</strong>
-                     {testImageResult.error && <p style={{ color: 'red' }}>Error: {testImageResult.error}</p>}
-                     {testImageResult.image_url && (
-                         <div>
-                            <p>Image URL Received:</p>
-                             <img
-                                src={testImageResult.image_url}
-                                alt={testImagePrompt || 'Generated test image'}
-                                style={{ maxWidth: '100%', maxHeight: '400px', height: 'auto', marginTop: '10px', border: '1px solid #ddd' }}
-                              />
-                         </div>
-                     )}
-                     {!testImageResult.error && !testImageResult.image_url && <p>Request sent, but no URL or error returned.</p>}
-                 </div>
-             )}
-        </div>
-
         <div className="card">
             <h2>Article Configuration</h2>
             <div>
