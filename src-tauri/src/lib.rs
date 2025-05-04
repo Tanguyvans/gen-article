@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use tauri_plugin_store::{JsonValue, StoreExt};
 
 const STORE_FILE: &str = ".settings.dat";
+
 const STORE_KEY_TEXT_API: &str = "textApiKey";
 const STORE_KEY_IMAGE_API: &str = "imageApiKey";
 const STORE_KEY_PROJECTS: &str = "projects";
@@ -28,6 +29,7 @@ type ProjectsMap = HashMap<String, ProjectSettings>;
 #[derive(Deserialize, Debug)]
 struct ArticleRequest {
     topic: String,
+    description: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -64,54 +66,36 @@ struct ImageGenResponse {
 }
 
 #[derive(Serialize, Debug)]
-struct OpenAiResponsesTool {
+struct OpenAiTool {
     #[serde(rename = "type")]
     tool_type: String,
 }
 
 #[derive(Serialize, Debug)]
-struct OpenAiResponsesApiRequest {
-    model: String,
-    input: String,
-    tools: Vec<OpenAiResponsesTool>,
+struct OpenAiRequestPayload<'a> {
+    model: &'a str,
+    tools: &'a [OpenAiTool],
+    input: &'a str,
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-struct OutputTextContent {
+struct OpenAiV1Response {
+    output: Vec<OpenAiV1Output>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiV1Output {
+    #[serde(rename = "type")]
+    output_type: String,
+    content: Vec<OpenAiV1Content>,
+    role: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiV1Content {
     #[serde(rename = "type")]
     content_type: String,
     text: String,
-}
-
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-struct OutputMessage {
-    #[serde(rename = "type")]
-    message_type: String,
-    role: String,
-    content: Vec<OutputTextContent>,
-}
-
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-struct WebSearchCall {
-    #[serde(rename = "type")]
-    call_type: String,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(untagged)]
-#[allow(dead_code)]
-enum OutputItem {
-    Message(OutputMessage),
-    Search(WebSearchCall),
-}
-
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-struct ResponsesApiResponse {
-    output: Vec<OutputItem>,
 }
 
 #[tauri::command]
@@ -182,9 +166,10 @@ async fn create_project(app: tauri::AppHandle, name: String) -> Result<(), Strin
 
             projects.insert(name.clone(), ProjectSettings::default());
 
-            let updated_projects_value = serde_json::to_value(&projects)
-                .map_err(|e| format!("Failed to serialize updated projects map: {}", e))?;
-            s.set(STORE_KEY_PROJECTS.to_string(), updated_projects_value);
+            s.set(
+                STORE_KEY_PROJECTS.to_string(),
+                serde_json::to_value(projects).unwrap(),
+            );
 
             s.save()
                 .map_err(|e| format!("Failed to save store: {}", e))?;
@@ -246,9 +231,10 @@ async fn save_project_settings(
 
             projects.insert(name.clone(), settings);
 
-            let updated_projects_value = serde_json::to_value(&projects)
-                .map_err(|e| format!("Failed to serialize updated projects map: {}", e))?;
-            s.set(STORE_KEY_PROJECTS.to_string(), updated_projects_value);
+            s.set(
+                STORE_KEY_PROJECTS.to_string(),
+                serde_json::to_value(projects).unwrap(),
+            );
 
             s.save()
                 .map_err(|e| format!("Failed to save store: {}", e))?;
@@ -291,12 +277,13 @@ async fn delete_project(app: tauri::AppHandle, name: String) -> Result<(), Strin
                 err_msg
             })?;
 
-            // Set the modified map back into the store (No error handling on set itself)
+            // Set the modified map back into the store (No error handling here, as set returns ())
             s.set(STORE_KEY_PROJECTS.to_string(), updated_projects_value);
+            // REMOVED: .map_err(|e| { ... })?;
 
             println!("Rust: Updated projects map set in store (in memory).");
 
-            // Save the store to persist the changes
+            // Save the store to persist the changes (Error handled here)
             s.save().map_err(|e| {
                 let err_msg = format!("Failed to save store after deletion: {}", e);
                 println!("Rust: Error - {}", &err_msg);
@@ -315,22 +302,6 @@ async fn delete_project(app: tauri::AppHandle, name: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-async fn greet(app: tauri::AppHandle) -> String {
-    match get_api_key(app.clone(), STORE_KEY_TEXT_API.to_string()).await {
-        Ok(Some(key)) => {
-            let display_key = if key.len() > 5 {
-                format!("{}...", &key[..5])
-            } else {
-                key
-            };
-            format!("Hello! Found OpenAI API key starting with: {}", display_key)
-        }
-        Ok(None) => "Hello! No OpenAI API key (textApiKey) found in store.".to_string(),
-        Err(e) => format!("Hello! Error getting key: {}", e),
-    }
-}
-
-#[tauri::command]
 async fn generate_article(
     app: tauri::AppHandle,
     request: ArticleRequest,
@@ -339,86 +310,89 @@ async fn generate_article(
         .await?
         .ok_or_else(|| "OpenAI API Key (textApiKey) not found in store.".to_string())?;
 
-    let user_input_prompt = format!(
-        "Generate a blog post about the topic '{topic}'. Use web search for current information.",
-        topic = request.topic
-    );
-
-    let client = Client::new();
     let api_endpoint = "https://api.openai.com/v1/responses";
+    let client = Client::new();
 
     let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {}", api_key))
-            .map_err(|e| format!("Invalid API Key format for header: {}", e))?,
+            .map_err(|e| format!("Invalid OpenAI API Key format: {}", e))?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+    let input_prompt = format!(
+        "Answer the question with the most recent data available on the internet '{topic}'",
+        topic = request.topic
     );
 
-    let request_payload = OpenAiResponsesApiRequest {
-        model: "gpt-4.1".to_string(),
-        input: user_input_prompt,
-        tools: vec![OpenAiResponsesTool {
-            tool_type: "web_search_preview".to_string(),
-        }],
+    let tools = [OpenAiTool {
+        tool_type: "web_search_preview".to_string(),
+    }];
+
+    let request_body = OpenAiRequestPayload {
+        model: "gpt-4o",
+        tools: &tools,
+        input: &input_prompt,
     };
 
-    println!("Sending request to OpenAI /v1/responses endpoint (model: gpt-4.1, tool: web_search_preview)...");
-    match serde_json::to_string_pretty(&request_payload) {
-        Ok(json_string) => println!("Request Payload:\n{}", json_string),
-        Err(e) => println!("Error serializing request payload: {}", e),
-    }
-
+    println!("Sending prompt to OpenAI API with web search...");
     let response = client
         .post(api_endpoint)
         .headers(headers)
-        .json(&request_payload)
+        .json(&request_body)
         .send()
         .await
         .map_err(|e| format!("Failed to send request to OpenAI API: {}", e))?;
 
     let status = response.status();
-    let response_text = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "Could not read response body".to_string());
-
     println!("Received response from OpenAI API (Status: {})", status);
-    println!("Response Body:\n{}", response_text);
 
     if status.is_success() {
-        let api_response: ResponsesApiResponse = serde_json::from_str(&response_text)
-            .map_err(|e| format!("Failed to parse OpenAI /v1/responses JSON structure: {}", e))?;
+        let raw_body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read OpenAI response body: {}", e))?;
+        println!("--- RAW OpenAI Response Body START ---");
+        println!("{}", raw_body);
+        println!("--- RAW OpenAI Response Body END ---");
 
-        println!("Parsed OpenAI /v1/responses success response using correct structure.");
+        let api_response: OpenAiV1Response = serde_json::from_str(&raw_body).map_err(|e| {
+            let err_msg = format!(
+                "Failed to parse OpenAI JSON response: {}. Raw body was: {}",
+                e, raw_body
+            );
+            println!("Rust Error: {}", err_msg);
+            err_msg
+        })?;
 
-        let mut article_text = String::new();
-        for item in api_response.output {
-            if let OutputItem::Message(msg) = item {
-                if let Some(text_content) = msg.content.into_iter().next() {
-                    article_text = text_content.text;
-                    break;
+        println!("Parsed OpenAI success response struct (using /v1/responses format).");
+
+        if let Some(output_item) = api_response.output.first() {
+            if let Some(content_item) = output_item.content.first() {
+                if content_item.content_type == "output_text" {
+                    println!("OpenAI response content found in output.");
+                    return Ok(ArticleResponse {
+                        article_text: content_item.text.clone(),
+                    });
                 }
             }
         }
 
-        if article_text.is_empty() {
-            Err(
-                "Could not find 'message' with 'output_text' content in OpenAI /v1/responses output array."
-                    .to_string(),
-            )
-        } else {
-            println!("Successfully extracted article text.");
-            Ok(ArticleResponse { article_text })
-        }
+        println!("OpenAI response parsed but expected content structure (output[0].content[0].text) not found.");
+        Err("OpenAI response structure unexpected after parsing.".to_string())
     } else {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Could not read error body".to_string());
         println!(
             "OpenAI API request failed - Status: {}, Body: {}",
-            status, response_text
+            status, error_text
         );
         Err(format!(
             "OpenAI API request failed with status {}: {}",
-            status, response_text
+            status, error_text
         ))
     }
 }
@@ -515,7 +489,6 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            greet,
             save_api_key,
             get_api_key,
             create_project,

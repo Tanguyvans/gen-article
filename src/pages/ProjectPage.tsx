@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, FormEvent, ChangeEvent } from 'react';
+import React, { useState, useEffect, useCallback, FormEvent, ChangeEvent } from 'react';
 import { invoke } from "@tauri-apps/api/core";
 import { DisplayFeedback } from '../App'; // Import type
 
@@ -20,6 +20,20 @@ interface ImageGenResponse {
     error: string | null;
 }
 
+// Interface for the data needed by the backend command (to be created/updated)
+interface SectionDefinition {
+    id: number; // Unique ID for React keys and manipulation
+    title: string;
+    instructions: string;
+}
+
+// Assuming backend expects this structure later
+interface FullArticleRequest {
+    tool_name: string;
+    tool_url: string | null;
+    sections: Omit<SectionDefinition, 'id'>[]; // Send title/instructions only
+}
+
 interface ProjectPageProps {
   projectName: string;
   displayFeedback: DisplayFeedback;
@@ -27,14 +41,24 @@ interface ProjectPageProps {
   onDelete: (projectName: string) => void; // Expects name for confirmation
 }
 
+// Helper to generate unique IDs for sections
+let nextSectionId = 1;
+const getNewSectionId = () => nextSectionId++;
+
 function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: ProjectPageProps) {
   const [currentSettings, setCurrentSettings] = useState<ProjectSettings | null>(null);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
-  // New state for generation
-  const [topic, setTopic] = useState("");
-  const [description, setDescription] = useState("");
+  // Removed topic/description state
   const [generatedArticle, setGeneratedArticle] = useState<string | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
+
+  // --- New State for Section-Based Generation ---
+  const [toolName, setToolName] = useState("");
+  const [toolUrl, setToolUrl] = useState("");
+  const [sectionDefinitions, setSectionDefinitions] = useState<SectionDefinition[]>([
+      // Start with one default section
+      { id: getNewSectionId(), title: "Introduction", instructions: "Write an engaging introduction for [Tool Name]..." }
+  ]);
 
   // --- State for Image Test ---
   const [testImagePrompt, setTestImagePrompt] = useState("");
@@ -50,6 +74,8 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
             );
             if (settings) {
                 setCurrentSettings(settings);
+                // Maybe pre-fill toolName from project name?
+                setToolName(name); // Or keep separate if preferred
             } else {
                  displayFeedback(`Settings not found for project ${name}. It might have been deleted. Returning to home.`, "error");
                  onBack(); // Go back if settings are gone
@@ -91,26 +117,86 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
       onDelete(projectName); // Call the delete handler passed from App
   };
 
-  // --- New Article Generation Handler ---
-  const handleGenerateArticle = async (e: FormEvent) => {
+  // --- Section Management Handlers ---
+  const handleAddSection = () => {
+      setSectionDefinitions(prev => [
+          ...prev,
+          { id: getNewSectionId(), title: `New Section ${prev.length + 1}`, instructions: "" }
+      ]);
+  };
+
+  const handleRemoveSection = (idToRemove: number) => {
+      setSectionDefinitions(prev => prev.filter(section => section.id !== idToRemove));
+  };
+
+  const handleMoveSection = (idToMove: number, direction: 'up' | 'down') => {
+      setSectionDefinitions(prev => {
+          const index = prev.findIndex(section => section.id === idToMove);
+          if (index === -1) return prev; // Should not happen
+
+          const newIndex = direction === 'up' ? index - 1 : index + 1;
+
+          // Check bounds
+          if (newIndex < 0 || newIndex >= prev.length) {
+              return prev; // Cannot move further
+          }
+
+          const newArray = [...prev];
+          // Simple swap
+          [newArray[index], newArray[newIndex]] = [newArray[newIndex], newArray[index]];
+          return newArray;
+      });
+  };
+
+  // Handler for changes within a specific section's inputs
+  const handleSectionChange = (idToUpdate: number, field: 'title' | 'instructions', value: string) => {
+    setSectionDefinitions(prev =>
+      prev.map(section =>
+        section.id === idToUpdate ? { ...section, [field]: value } : section
+      )
+    );
+  };
+  // --- End Section Management Handlers ---
+
+  // --- Updated Article Generation Handler ---
+  const handleGenerateFullArticle = async (e: FormEvent) => {
       e.preventDefault();
-      if (!topic.trim() || !description.trim()) {
-          displayFeedback("Please provide both Topic and Description.", "error");
+      if (!toolName.trim()) {
+          displayFeedback("Please enter the Tool Name.", "error");
           return;
       }
+       if (sectionDefinitions.length === 0) {
+           displayFeedback("Please add at least one section.", "error");
+           return;
+       }
+       if (sectionDefinitions.some(sec => !sec.title.trim() || !sec.instructions.trim())) {
+           displayFeedback("Please fill in titles and instructions for all sections.", "error");
+           return;
+       }
+
       setIsGenerating(true);
-      setGeneratedArticle(null); // Clear previous article
-      displayFeedback("Generating article...", "success");
+      setGeneratedArticle(null);
+      displayFeedback("Generating full article...", "success");
+
+      // Prepare payload for the backend
+      const requestPayload: FullArticleRequest = {
+          tool_name: toolName,
+          tool_url: toolUrl.trim() || null,
+          sections: sectionDefinitions.map(({ id, ...rest }) => rest),
+      };
 
       try {
-          const request = { topic, description };
-          const response = await invoke<ArticleResponse>("generate_article", { request });
+          // IMPORTANT: We need a new backend command, e.g., "generate_full_article"
+          // The old "generate_article" command expects different input.
+          // Replace "generate_article" with the correct NEW command name once created.
+          console.log("Sending payload to backend:", requestPayload);
+          const response = await invoke<ArticleResponse>("generate_full_article", { request: requestPayload });
           setGeneratedArticle(response.article_text);
-          displayFeedback("Article generated successfully!", "success");
+          displayFeedback("Full article generated successfully!", "success");
 
       } catch(err) {
-          console.error("Article generation failed:", err);
-          displayFeedback(`Article generation failed: ${err}`, "error");
+          console.error("Full article generation failed:", err);
+          displayFeedback(`Full article generation failed: ${err}`, "error");
           setGeneratedArticle(null);
       } finally {
           setIsGenerating(false);
@@ -196,73 +282,115 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         </div>
 
         <div className="card">
-            <h2>Generate New Article</h2>
-            <form onSubmit={handleGenerateArticle}>
+            <h2>Article Configuration</h2>
+            <form onSubmit={handleGenerateFullArticle}>
+                {/* Global Info */}
                 <div className="row">
-                    <label htmlFor="topic">Topic:</label>
+                    <label htmlFor="toolName">Tool Name:</label>
                     <input
-                       id="topic"
-                       type="text"
-                       value={topic}
-                       onChange={(e) => setTopic(e.target.value)}
-                       placeholder="Enter the main topic"
-                       required
-                       disabled={isGenerating}
-                    />
+                       id="toolName" type="text" value={toolName}
+                       onChange={(e) => setToolName(e.target.value)}
+                       placeholder="Enter the name of the AI tool" required disabled={isGenerating}
+                     />
                 </div>
                 <div className="row">
-                    <label htmlFor="description">Description:</label>
-                    <textarea
-                        id="description"
-                        value={description}
-                        onChange={(e) => setDescription(e.target.value)}
-                        rows={3}
-                        placeholder="Briefly describe the desired article content and angle"
-                        required
-                        disabled={isGenerating}
+                    <label htmlFor="toolUrl">Tool URL (Optional):</label>
+                    <input
+                       id="toolUrl" type="url" value={toolUrl}
+                       onChange={(e) => setToolUrl(e.target.value)}
+                       placeholder="https://example.com" disabled={isGenerating}
                     />
                 </div>
-                <button type="submit" disabled={isGenerating || isTestingImage}>
-                    {isGenerating ? "Generating Article..." : "Generate Article Text"}
+
+                {/* Dynamic Section Inputs */}
+                <h3 style={{ marginTop: '30px', borderTop: '1px solid #eee', paddingTop: '20px' }}>Article Sections:</h3>
+                {sectionDefinitions.length === 0 && <p>No sections defined yet. Click "Add Section" to start.</p>}
+                {sectionDefinitions.map((section, index) => (
+                    <div key={section.id} className="card section-editor" style={{ background: '#f8f9fa', marginBottom: '15px', border: '1px solid #dee2e6', padding: '15px' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                            <h4>Section {index + 1}</h4>
+                            {/* Section Controls */}
+                            <div className="section-controls" style={{ display: 'flex', gap: '5px' }}>
+                                <button type="button" onClick={() => handleMoveSection(section.id, 'up')} disabled={index === 0 || isGenerating} title="Move Up" style={{ padding: '0.3em 0.6em'}}>&#8593;</button>
+                                <button type="button" onClick={() => handleMoveSection(section.id, 'down')} disabled={index === sectionDefinitions.length - 1 || isGenerating} title="Move Down" style={{ padding: '0.3em 0.6em'}}>&#8595;</button>
+                                <button type="button" onClick={() => handleRemoveSection(section.id)} disabled={isGenerating} title="Remove Section" style={{ padding: '0.3em 0.6em', color: 'red' }}>&times;</button>
+                            </div>
+                        </div>
+                        {/* Section Inputs */}
+                        <div className="row">
+                            <label htmlFor={`section-title-${section.id}`} style={{ minWidth: '100px' }}>Title:</label> {/* Adjusted label width */}
+                            <input
+                               id={`section-title-${section.id}`}
+                               type="text"
+                               value={section.title}
+                               onChange={(e) => handleSectionChange(section.id, 'title', e.target.value)}
+                               placeholder={`Enter title for section ${index + 1}`}
+                               required
+                               disabled={isGenerating}
+                            />
+                        </div>
+                         <div className="row" style={{ alignItems: 'flex-start' }}>
+                            <label htmlFor={`section-instructions-${section.id}`} style={{ minWidth: '100px' }}>Instructions:</label> {/* Adjusted label width */}
+                            <textarea
+                               id={`section-instructions-${section.id}`}
+                               value={section.instructions}
+                               onChange={(e) => handleSectionChange(section.id, 'instructions', e.target.value)}
+                               rows={5}
+                               placeholder={`Enter detailed prompt/instructions for section ${index + 1}...`}
+                               required
+                               disabled={isGenerating}
+                            />
+                        </div>
+                    </div>
+                ))}
+                {/* Add Section Button */}
+                <button type="button" onClick={handleAddSection} disabled={isGenerating} style={{ marginTop: '10px' }}>
+                    + Add Section
+                </button>
+
+                <button type="submit" disabled={isGenerating || sectionDefinitions.length === 0} style={{ marginTop: '20px', display: 'block', width: '100%' }}>
+                    {isGenerating ? "Generating..." : "Generate Full Article"}
                 </button>
             </form>
 
             {/* Display Generated Article */}
             {generatedArticle && (
                 <div className="generated-article-container" style={{ marginTop: '20px', borderTop: '1px solid #eee', paddingTop: '20px' }}>
-                    <h3>Generated Article Text:</h3>
+                    <h3>Generated Full Article HTML:</h3>
                     {/* Using pre-wrap to preserve whitespace and line breaks */}
-                    <pre style={{ whiteSpace: 'pre-wrap', wordWrap: 'break-word', background: '#f9f9f9', padding: '15px', borderRadius: '4px', marginBottom: '20px' }}>
-                        {generatedArticle}
-                    </pre>
+                    <textarea
+                       readOnly
+                       value={generatedArticle}
+                       style={{ width: '100%', minHeight: '400px', whiteSpace: 'pre-wrap', wordWrap: 'break-word', background: '#f9f9f9', padding: '15px', borderRadius: '4px', border: '1px solid #ccc', boxSizing: 'border-box', fontFamily: 'monospace' }}
+                    />
                 </div>
             )}
          </div>
 
          <div className="card">
-            <h2>Project Settings</h2>
+            <h2>Project Base Settings</h2>
             {isLoadingSettings && <p>Loading settings...</p>}
             {!isLoadingSettings && currentSettings && (
                 <form onSubmit={handleSaveSettings}>
                     <div className="row">
                         <label htmlFor="wp-url">WordPress URL:</label>
-                        <input type="text" id="wp-url" name="wordpress_url" value={currentSettings.wordpress_url} onChange={handleSettingsChange} placeholder="https://your-site.com" disabled={isGenerating || isTestingImage} />
+                        <input type="text" id="wp-url" name="wordpress_url" value={currentSettings.wordpress_url} onChange={handleSettingsChange} placeholder="https://your-site.com" disabled={isGenerating} />
                     </div>
                     <div className="row">
                         <label htmlFor="wp-user">WordPress User:</label>
-                        <input type="text" id="wp-user" name="wordpress_user" value={currentSettings.wordpress_user} onChange={handleSettingsChange} disabled={isGenerating || isTestingImage}/>
+                        <input type="text" id="wp-user" name="wordpress_user" value={currentSettings.wordpress_user} onChange={handleSettingsChange} disabled={isGenerating}/>
                     </div>
                     <div className="row">
                         <label htmlFor="wp-pass">WordPress Pass:</label>
-                        <input type="password" id="wp-pass" name="wordpress_pass" value={currentSettings.wordpress_pass} onChange={handleSettingsChange} placeholder="App Password Recommended" disabled={isGenerating || isTestingImage}/>
+                        <input type="password" id="wp-pass" name="wordpress_pass" value={currentSettings.wordpress_pass} onChange={handleSettingsChange} placeholder="App Password Recommended" disabled={isGenerating}/>
                     </div>
                      <div className="row">
                         <label htmlFor="prompt">Default Project Prompt:</label>
-                        <textarea id="prompt" name="generation_prompt" value={currentSettings.generation_prompt} onChange={handleSettingsChange} rows={4} disabled={isGenerating || isTestingImage}/>
+                        <textarea id="prompt" name="generation_prompt" value={currentSettings.generation_prompt} onChange={handleSettingsChange} rows={4} disabled={isGenerating}/>
                     </div>
                     <div className="row" style={{ justifyContent: 'space-between', marginTop: '20px' }}>
-                         <button type="button" onClick={handleDeleteClick} className="delete-button" disabled={isGenerating || isTestingImage}>Delete Project</button>
-                         <button type="submit" disabled={isGenerating || isTestingImage}>Save Project Settings</button>
+                         <button type="button" onClick={handleDeleteClick} className="delete-button" disabled={isGenerating}>Delete Project</button>
+                         <button type="submit" disabled={isGenerating}>Save Base Settings</button>
                     </div>
 
                 </form>
