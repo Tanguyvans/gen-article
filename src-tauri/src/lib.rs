@@ -28,7 +28,6 @@ type ProjectsMap = HashMap<String, ProjectSettings>;
 #[derive(Deserialize, Debug)]
 struct ArticleRequest {
     topic: String,
-    description: String,
 }
 
 #[derive(Serialize, Debug)]
