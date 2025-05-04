@@ -98,7 +98,7 @@ function App() {
             onProjectSelect={handleProjectSelect} // Callback to select a project
           />
         );
-      }
+  }
     }
     // Fallback or loading state if needed
     return <div>Loading...</div>;
@@ -113,7 +113,7 @@ function App() {
         {successMsg && <div className="feedback success">{successMsg}</div>}
         {/* Render the current page content */}
         {renderContent()}
-      </main>
+    </main>
     </div>
   );
 }

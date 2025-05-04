@@ -1,7 +1,4 @@
-use langchain_rust::language_models::llm::LLM;
-use langchain_rust::llm::openai::OpenAI;
-use langchain_rust::llm::OpenAIConfig;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::multipart;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -10,8 +7,7 @@ use std::path::PathBuf;
 use tauri_plugin_store::{JsonValue, StoreExt};
 
 const STORE_FILE: &str = ".settings.dat";
-
-const STORE_KEY_TEXT_API: &str = "textApiKey";
+const STORE_KEY_GROK_API: &str = "grokApiKey";
 const STORE_KEY_IMAGE_API: &str = "imageApiKey";
 const STORE_KEY_PROJECTS: &str = "projects";
 
@@ -66,6 +62,35 @@ struct IdeogramImageData {
 struct ImageGenResponse {
     image_url: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct GrokMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize, Debug)]
+struct GrokRequestPayload<'a> {
+    messages: &'a [GrokMessage],
+    model: &'a str,
+    temperature: f32,
+    stream: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct GrokResponse {
+    choices: Vec<GrokChoice>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GrokChoice {
+    message: GrokResponseMessage,
+}
+
+#[derive(Deserialize, Debug)]
+struct GrokResponseMessage {
+    content: String,
 }
 
 #[tauri::command]
@@ -136,10 +161,9 @@ async fn create_project(app: tauri::AppHandle, name: String) -> Result<(), Strin
 
             projects.insert(name.clone(), ProjectSettings::default());
 
-            s.set(
-                STORE_KEY_PROJECTS.to_string(),
-                serde_json::to_value(projects).unwrap(),
-            );
+            let updated_projects_value = serde_json::to_value(&projects)
+                .map_err(|e| format!("Failed to serialize updated projects map: {}", e))?;
+            s.set(STORE_KEY_PROJECTS.to_string(), updated_projects_value);
 
             s.save()
                 .map_err(|e| format!("Failed to save store: {}", e))?;
@@ -201,10 +225,9 @@ async fn save_project_settings(
 
             projects.insert(name.clone(), settings);
 
-            s.set(
-                STORE_KEY_PROJECTS.to_string(),
-                serde_json::to_value(projects).unwrap(),
-            );
+            let updated_projects_value = serde_json::to_value(&projects)
+                .map_err(|e| format!("Failed to serialize updated projects map: {}", e))?;
+            s.set(STORE_KEY_PROJECTS.to_string(), updated_projects_value);
 
             s.save()
                 .map_err(|e| format!("Failed to save store: {}", e))?;
@@ -247,13 +270,12 @@ async fn delete_project(app: tauri::AppHandle, name: String) -> Result<(), Strin
                 err_msg
             })?;
 
-            // Set the modified map back into the store (No error handling here, as set returns ())
+            // Set the modified map back into the store (No error handling on set itself)
             s.set(STORE_KEY_PROJECTS.to_string(), updated_projects_value);
-            // REMOVED: .map_err(|e| { ... })?;
 
             println!("Rust: Updated projects map set in store (in memory).");
 
-            // Save the store to persist the changes (Error handled here)
+            // Save the store to persist the changes
             s.save().map_err(|e| {
                 let err_msg = format!("Failed to save store after deletion: {}", e);
                 println!("Rust: Error - {}", &err_msg);
@@ -273,16 +295,16 @@ async fn delete_project(app: tauri::AppHandle, name: String) -> Result<(), Strin
 
 #[tauri::command]
 async fn greet(app: tauri::AppHandle) -> String {
-    match get_api_key(app.clone(), STORE_KEY_TEXT_API.to_string()).await {
+    match get_api_key(app.clone(), STORE_KEY_GROK_API.to_string()).await {
         Ok(Some(key)) => {
             let display_key = if key.len() > 5 {
                 format!("{}...", &key[..5])
             } else {
                 key
             };
-            format!("Hello! Found text API key starting with: {}", display_key)
+            format!("Hello! Found Grok API key starting with: {}", display_key)
         }
-        Ok(None) => "Hello! No text API key found in store.".to_string(),
+        Ok(None) => "Hello! No Grok API key found in store.".to_string(),
         Err(e) => format!("Hello! Error getting key: {}", e),
     }
 }
@@ -292,15 +314,27 @@ async fn generate_article(
     app: tauri::AppHandle,
     request: ArticleRequest,
 ) -> Result<ArticleResponse, String> {
-    let api_key = get_api_key(app.clone(), STORE_KEY_TEXT_API.to_string())
+    let api_key = get_api_key(app.clone(), STORE_KEY_GROK_API.to_string())
         .await?
-        .ok_or_else(|| "Text Generation API Key not found in store.".to_string())?;
+        .ok_or_else(|| "Grok API Key (grokApiKey) not found in store.".to_string())?;
 
-    let open_ai = OpenAI::default().with_config(OpenAIConfig::default().with_api_key(api_key));
+    let api_endpoint = "https://api.x.ai/v1/chat/completions";
+    let client = Client::new();
 
-    let user_prompt = format!(
-        "You are a helpful assistant that writes blog posts with image placeholders. \
-        Generate a blog post about the topic '{topic}'. \
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", api_key))
+            .map_err(|e| format!("Invalid Grok API Key format: {}", e))?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+    let system_message = GrokMessage {
+        role: "system".to_string(),
+        content: "You are a helpful assistant that writes blog posts with image placeholders in the format [[Image of a descriptive caption]].".to_string(),
+    };
+    let user_prompt_content = format!(
+        "Generate a blog post about the topic '{topic}'. \
         The article should be described as: '{description}'. \
         Please structure the article well with clear headings. \
         Crucially, include placeholders for relevant images using the format [[Image of a descriptive caption]]. For example: [[Image of a futuristic cityscape]]. \
@@ -308,18 +342,60 @@ async fn generate_article(
         topic = request.topic,
         description = request.description
     );
+    let user_message = GrokMessage {
+        role: "user".to_string(),
+        content: user_prompt_content,
+    };
+    let messages = [system_message, user_message];
 
-    println!("Sending prompt to LLM...");
-    let response = open_ai
-        .invoke(&user_prompt)
+    let request_body = GrokRequestPayload {
+        messages: &messages,
+        model: "grok-3-latest",
+        temperature: 0.7,
+        stream: false,
+    };
+
+    println!("Sending prompt to Grok API...");
+    let response = client
+        .post(api_endpoint)
+        .headers(headers)
+        .json(&request_body)
+        .send()
         .await
-        .map_err(|e| format!("LLM invocation failed: {}", e))?;
+        .map_err(|e| format!("Failed to send request to Grok API: {}", e))?;
 
-    println!("Received response from LLM.");
+    let status = response.status();
+    println!("Received response from Grok API (Status: {})", status);
 
-    Ok(ArticleResponse {
-        article_text: response,
-    })
+    if status.is_success() {
+        let api_response = response
+            .json::<GrokResponse>()
+            .await
+            .map_err(|e| format!("Failed to parse Grok JSON response: {}", e))?;
+        println!("Parsed Grok success response.");
+        if let Some(choice) = api_response.choices.first() {
+            println!("Grok response content received.");
+            Ok(ArticleResponse {
+                article_text: choice.message.content.clone(),
+            })
+        } else {
+            println!("Grok response successful but 'choices' array was empty.");
+            Err("Grok response 'choices' array was empty.".to_string())
+        }
+    } else {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Could not read error body".to_string());
+        println!(
+            "Grok API request failed - Status: {}, Body: {}",
+            status, error_text
+        );
+        Err(format!(
+            "Grok API request failed with status {}: {}",
+            status, error_text
+        ))
+    }
 }
 
 #[tauri::command]
