@@ -2,6 +2,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::multipart;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::Manager;
@@ -140,6 +141,16 @@ struct ApiKeys {
     openai_api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ideogram_api_key: Option<String>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct SuggestImagePromptsRequest {
+    article_text: String,
+}
+
+#[derive(Serialize, Debug)]
+struct SuggestImagePromptsResponse {
+    prompts: Vec<String>,
 }
 
 #[tauri::command]
@@ -563,6 +574,138 @@ Assurez-vous que la sortie est uniquement le code HTML complet de l'article, en 
     }
 }
 
+#[tauri::command]
+async fn suggest_image_prompts(
+    request: SuggestImagePromptsRequest,
+    app: tauri::AppHandle,
+) -> Result<SuggestImagePromptsResponse, String> {
+    println!("Rust: Received request to suggest image prompts.");
+
+    let api_key = get_api_key(app.clone(), STORE_KEY_TEXT_API.to_string())
+        .await?
+        .ok_or_else(|| "OpenAI API Key (textApiKey) not found in store.".to_string())?;
+    println!("Rust: Using API Key for prompt suggestion.");
+
+    let suggestion_prompt = format!(
+        r#"Based on the following article text, suggest 3-5 diverse image prompts suitable for illustrating it. Focus on key themes, concepts, or visual metaphors described in the text.
+
+Output ONLY a valid JSON array of strings, where each string is a suggested image prompt. Example output format: ["prompt idea 1", "prompt idea 2", "a third idea"]
+
+Article Text:
+---
+{article}
+---
+
+Suggested Prompts (JSON Array Only):"#,
+        article = request.article_text
+    );
+
+    println!(
+        "--- Prompt for Image Suggestion ---\n{}\n--- End Prompt ---",
+        suggestion_prompt
+    );
+
+    let client = reqwest::Client::new();
+    let api_url = "https://api.openai.com/v1/chat/completions";
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4-turbo",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are an assistant that suggests image prompts based on provided text and outputs ONLY a valid JSON array of strings."
+            },
+            {
+                "role": "user",
+                "content": suggestion_prompt
+            }
+        ],
+        "temperature": 0.5
+    });
+
+    println!("Rust: Sending request to OpenAI for image prompt suggestions...");
+    let response = client
+        .post(api_url)
+        .bearer_auth(&api_key)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to OpenAI: {}", e))?;
+
+    let status = response.status();
+    let response_body_text = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read OpenAI response body: {}", e))?;
+    println!(
+        "Rust: Received suggestion response from OpenAI (Status: {})",
+        status
+    );
+
+    if status.is_success() {
+        match serde_json::from_str::<OpenAiApiResponse>(&response_body_text) {
+            Ok(parsed_response) => {
+                if let Some(choice) = parsed_response.choices.get(0) {
+                    let content = &choice.message.content;
+                    println!(
+                        "Rust: Extracted content potentially containing JSON: {}",
+                        content
+                    );
+                    match serde_json::from_str::<Vec<String>>(content) {
+                        Ok(prompts) => {
+                            println!("Rust: Successfully parsed suggested prompts: {:?}", prompts);
+                            Ok(SuggestImagePromptsResponse { prompts })
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Rust: Failed to parse content as JSON array: {}. Content was: {}",
+                                e, content
+                            );
+                            Err(format!(
+                                "LLM response content was not a valid JSON array of strings: {}",
+                                e
+                            ))
+                        }
+                    }
+                } else {
+                    eprintln!("Rust: OpenAI response successful but 'choices' array is empty.");
+                    Err("OpenAI response structure unexpected (no choices)".to_string())
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Rust: Failed to parse primary OpenAI response structure: {:?}",
+                    e
+                );
+                eprintln!("Rust: Raw response body was:\n{}", response_body_text);
+                println!("Rust: Attempting fallback parse directly as JSON array...");
+                match serde_json::from_str::<Vec<String>>(&response_body_text) {
+                    Ok(prompts) => {
+                        println!("Rust: Fallback parse successful: {:?}", prompts);
+                        Ok(SuggestImagePromptsResponse { prompts })
+                    }
+                    Err(fallback_e) => {
+                        eprintln!("Rust: Fallback parse also failed: {}", fallback_e);
+                        Err(format!(
+                            "Failed to parse OpenAI response: {}. Fallback failed: {}",
+                            e, fallback_e
+                        ))
+                    }
+                }
+            }
+        }
+    } else {
+        eprintln!(
+            "Rust: OpenAI API request for suggestions failed - Status: {}, Body:\n{}",
+            status, response_body_text
+        );
+        Err(format!(
+            "OpenAI API request failed with status {}: {}",
+            status, response_body_text
+        ))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -610,7 +753,8 @@ pub fn run() {
             save_project_settings,
             delete_project,
             generate_ideogram_image,
-            generate_full_article
+            generate_full_article,
+            suggest_image_prompts
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

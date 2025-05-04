@@ -46,6 +46,11 @@ function App() {
     // }
   }, []);
 
+  // --- Wrap the onBack function creation in useCallback ---
+  const handleBackFromProject = useCallback(() => {
+      handleProjectSelect(null); // Call the stable function
+  }, [handleProjectSelect]); // Depend on the stable handleProjectSelect
+
   // --- Updated Delete Callback - REMOVED Confirmation ---
   const handleProjectDelete = useCallback(async (projectName: string) => {
     console.log(`[App] handleProjectDelete initiated for: ${projectName}`);
@@ -85,7 +90,7 @@ function App() {
           <ProjectPage
             projectName={selectedProject}
             displayFeedback={displayFeedback}
-            onBack={() => handleProjectSelect(null)} // Go back to project list
+            onBack={handleBackFromProject} // Use the memoized callback
             onDelete={handleProjectDelete} // Pass delete handler
           />
         );

@@ -42,6 +42,19 @@ interface FullArticleRequest {
     sections: SectionDefinitionData[]; // Send instructions only
 }
 
+// --- NEW Response Interface for Suggestions ---
+interface SuggestImagePromptsResponse {
+    prompts: string[];
+}
+
+// --- NEW Request Interface for Suggestions ---
+interface SuggestImagePromptsRequest {
+    article_text: string;
+}
+
+// --- NEW Type for storing image generation results per prompt ---
+type ImageGenResults = Record<number, ImageGenResponse>; // Keyed by prompt index
+
 interface ProjectPageProps {
   projectName: string;
   displayFeedback: DisplayFeedback;
@@ -65,10 +78,21 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   const [isTestingImage, setIsTestingImage] = useState(false);
 
   // State specifically for the inputs managed in the base settings form
-  // We keep these separate from currentSettings to avoid overwriting sections unintentionally
   const [articleGoalPromptInput, setArticleGoalPromptInput] = useState("");
   const [exampleUrlInput, setExampleUrlInput] = useState("");
 
+  // --- NEW Image Prompt Suggestion State ---
+  const [isSuggestingPrompts, setIsSuggestingPrompts] = useState(false);
+  const [suggestedPrompts, setSuggestedPrompts] = useState<string[] | null>(null);
+  const [editedPrompts, setEditedPrompts] = useState<Record<number, string>>({}); // Store edits, keyed by index
+
+  // --- NEW Image Generation State (per prompt) ---
+  const [imageGenResults, setImageGenResults] = useState<ImageGenResults>({});
+  const [isGeneratingImage, setIsGeneratingImage] = useState<Record<number, boolean>>({}); // Track loading per prompt
+
+  // --- ADD LOGGING INSIDE RENDER ---
+  console.log("[ProjectPage Render] generatedArticle state:", generatedArticle ? generatedArticle.substring(0, 100) + "..." : generatedArticle);
+  // --- END LOGGING ---
 
   const fetchProjectSettings = useCallback(async (name: string) => {
         setIsLoadingSettings(true);
@@ -76,6 +100,13 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         setArticleGoalPromptInput(""); // Clear inputs
         setExampleUrlInput("");      // Clear inputs
         setToolNameInput("");
+        // --- ADD Reset for new state ---
+        setGeneratedArticle(null);
+        setSuggestedPrompts(null); // Clear suggestions
+        setEditedPrompts({});
+        setImageGenResults({});
+        setIsGeneratingImage({});
+        // --- END Reset ---
         try {
             const settings = await invoke<ProjectSettings | null>(
                 "get_project_settings", { name: name }
@@ -283,6 +314,12 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
 
       setIsGenerating(true);
       setGeneratedArticle(null);
+      // --- ADD Reset for image prompt state when generating new article ---
+      setSuggestedPrompts(null); // Clear previous suggestions
+      setEditedPrompts({});
+      setImageGenResults({});
+      setIsGeneratingImage({});
+      // --- END Reset ---
       displayFeedback("Generating full article...", "warning");
 
       // Prepare payload using current input state for goal/url and editor state for sections
@@ -296,8 +333,16 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
       try {
           console.log("Sending payload to backend:", requestPayload);
           const response = await invoke<ArticleResponse>("generate_full_article", { request: requestPayload });
-          setGeneratedArticle(response.article_text);
-          displayFeedback("Full article generated successfully!", "success");
+          console.log("Frontend received response from invoke:", response);
+          if (response && response.article_text) {
+             console.log("Attempting to set generatedArticle state with:", response.article_text.substring(0, 200) + "..."); // Log beginning of text
+             setGeneratedArticle(response.article_text);
+             displayFeedback("Full article generated successfully!", "success");
+          } else {
+             console.error("Frontend received response but article_text is missing or empty:", response);
+             displayFeedback("Received response, but article content was missing.", "error");
+             setGeneratedArticle(null); // Ensure state is nullified if response is bad
+          }
 
       } catch(err) {
           console.error("Full article generation failed:", err);
@@ -306,6 +351,85 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
           setGeneratedArticle(null);
       } finally {
           setIsGenerating(false);
+      }
+  };
+
+  // --- NEW Image Prompt Suggestion Handler ---
+  const handleSuggestImagePrompts = async () => {
+    if (!generatedArticle) {
+        displayFeedback("Please generate an article first.", "error");
+        return;
+    }
+    setIsSuggestingPrompts(true);
+    setSuggestedPrompts(null); // Clear previous
+    setEditedPrompts({});
+    setImageGenResults({});
+    setIsGeneratingImage({});
+    displayFeedback("Suggesting image prompts...", "warning");
+
+    try {
+        const request: SuggestImagePromptsRequest = { article_text: generatedArticle };
+        const response = await invoke<SuggestImagePromptsResponse>("suggest_image_prompts", { request });
+        setSuggestedPrompts(response.prompts);
+        // Initialize edited prompts state
+        const initialEdits: Record<number, string> = {};
+        response.prompts.forEach((prompt, index) => {
+            initialEdits[index] = prompt; // Start with suggested prompt
+        });
+        setEditedPrompts(initialEdits);
+        displayFeedback("Image prompts suggested.", "success");
+    } catch (err) {
+        console.error("Failed to suggest image prompts:", err);
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        displayFeedback(`Error suggesting prompts: ${errorMsg}`, "error");
+        setSuggestedPrompts([]); // Set to empty array on error?
+    } finally {
+        setIsSuggestingPrompts(false);
+    }
+  };
+
+  // --- NEW Handler for Edited Prompt Changes ---
+  const handleEditedPromptChange = (index: number, value: string) => {
+      setEditedPrompts(prev => ({
+          ...prev,
+          [index]: value
+      }));
+  };
+
+  // --- NEW Handler for Generating Image for a SPECIFIC Prompt ---
+  const handleGenerateSpecificImage = async (index: number) => {
+      const promptToUse = editedPrompts[index]; // Get current value from state
+      if (!promptToUse || !promptToUse.trim()) {
+          displayFeedback(`Please enter a prompt for image ${index + 1}.`, "error");
+          return;
+      }
+
+      setIsGeneratingImage(prev => ({ ...prev, [index]: true })); // Set loading for this specific image
+      setImageGenResults(prev => ({ ...prev, [index]: { image_url: null, error: null } })); // Clear previous result
+      displayFeedback(`Requesting image ${index + 1} for: "${promptToUse.substring(0, 30)}..."`, "success");
+
+      try {
+          // Assuming ImageGenRequest is defined elsewhere or in Rust code only for now
+          const response = await invoke<ImageGenResponse>("generate_ideogram_image", {
+              request: { prompt: promptToUse } // Send the current prompt text
+          });
+          setImageGenResults(prev => ({ ...prev, [index]: response })); // Store result for this index
+
+          if (response.error) {
+              displayFeedback(`Image ${index + 1} generation failed: ${response.error}`, "error");
+          } else if (response.image_url) {
+              displayFeedback(`Image ${index + 1} generated successfully!`, "success");
+          } else {
+              displayFeedback(`Image ${index + 1} generation completed but no URL returned.`, "warning");
+          }
+
+      } catch(err) {
+          console.error(`Image ${index + 1} generation invoke failed:`, err);
+          const errorMsg = err instanceof Error ? err.message : String(err);
+          displayFeedback(`Image ${index + 1} generation failed: ${errorMsg}`, "error");
+          setImageGenResults(prev => ({ ...prev, [index]: { image_url: null, error: errorMsg } }));
+      } finally {
+          setIsGeneratingImage(prev => ({ ...prev, [index]: false })); // Clear loading for this specific image
       }
   };
 
@@ -483,18 +607,74 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                      {isGenerating ? "Generating..." : "Generate Full Article"}
                  </button>
              </div>
-              {/* Display Generated Article */}
-             {generatedArticle && (
+              {/* Display Generated Article Area - REMOVED outer conditional */}
                  <div className="generated-article-container" style={{ marginTop: '20px', borderTop: '1px solid #eee', paddingTop: '20px' }}>
                      <h3>Generated Full Article HTML:</h3>
                      <textarea
                         readOnly
-                        value={generatedArticle}
+                        // Display placeholder if article is null, or the article itself
+                        value={generatedArticle || "Article will appear here after generation..."}
+                        placeholder="Article will appear here after generation..." // Added placeholder
                         style={{ width: '100%', minHeight: '400px', whiteSpace: 'pre-wrap', wordWrap: 'break-word', background: '#f9f9f9', padding: '15px', borderRadius: '4px', border: '1px solid #ccc', boxSizing: 'border-box', fontFamily: 'monospace' }}
                      />
+                     {/* --- Button to Suggest Prompts - Now uses defined state/handler --- */}
+                     <button
+                        type="button"
+                        onClick={handleSuggestImagePrompts}
+                        disabled={isGenerating || isSuggestingPrompts || !generatedArticle} // Uses defined state
+                        style={{ marginTop: '15px' }}
+                    >
+                        {isSuggestingPrompts ? 'Suggesting...' : 'Suggest Image Prompts'} {/* Uses defined state */}
+                    </button>
                  </div>
-             )}
         </div>
+
+        {/* --- NEW Image Prompt Suggestion & Generation Card --- */}
+        {suggestedPrompts && suggestedPrompts.length > 0 && (
+            <div className="card">
+                <h2>Image Prompt Suggestions</h2>
+                {suggestedPrompts.map((_, index) => (
+                    <div key={`prompt-${index}`} className="prompt-generation-row" style={{ marginBottom: '20px', paddingBottom: '20px', borderBottom: '1px solid #eee' }}>
+                        <label htmlFor={`prompt-input-${index}`} style={{ display: 'block', marginBottom: '5px' }}>Prompt {index + 1}:</label>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                            <textarea
+                                id={`prompt-input-${index}`}
+                                value={editedPrompts[index] || ''} // Use edited prompt state
+                                onChange={(e) => handleEditedPromptChange(index, e.target.value)} // Use handler
+                                rows={3}
+                                placeholder={`Edit suggested prompt ${index + 1}...`}
+                                disabled={isGeneratingImage[index] || isGenerating || isSuggestingPrompts} // Use states
+                                style={{ flexGrow: 1, minHeight: '60px' }}
+                            />
+                            <button
+                                type="button"
+                                onClick={() => handleGenerateSpecificImage(index)} // Use handler
+                                disabled={isGeneratingImage[index] || !editedPrompts[index]?.trim()} // Use states
+                                style={{ height: '60px', alignSelf: 'stretch' }} // Match height roughly
+                            >
+                                {isGeneratingImage[index] ? 'Generating...' : 'Generate Image'} {/* Use state */}
+                            </button>
+                        </div>
+                        {/* Display Result for this prompt */}
+                        {imageGenResults[index] && ( // Use state
+                             <div style={{ marginTop: '10px' }}>
+                                 {imageGenResults[index].error && <p style={{ color: 'red' }}>Error: {imageGenResults[index].error}</p>}
+                                 {imageGenResults[index].image_url && (
+                                     <div>
+                                        <p>Generated Image {index + 1}:</p>
+                                         <img
+                                            src={imageGenResults[index].image_url!} // Use non-null assertion or check
+                                            alt={`Generated image for prompt ${index + 1}`}
+                                            style={{ maxWidth: '100%', maxHeight: '300px', height: 'auto', marginTop: '5px', border: '1px solid #ddd' }}
+                                          />
+                                     </div>
+                                 )}
+                             </div>
+                         )}
+                    </div>
+                ))}
+            </div>
+        )}
 
         <div className="card">
             <h2>Project Base Settings</h2>
