@@ -45,23 +45,32 @@ function App() {
   }, []);
 
   const handleProjectDelete = useCallback(async (projectName: string) => {
-     // Confirmation dialog is good practice
-     if (!window.confirm(`Are you sure you want to delete project "${projectName}"? This cannot be undone.`)) {
-         return;
-     }
-     displayFeedback(`Deleting project ${projectName}...`, "success");
-     try {
-         // Ensure 'delete_project' command exists and is registered in Rust
-         await invoke("delete_project", { name: projectName });
-         displayFeedback(`Project '${projectName}' deleted.`, "success");
-         setSelectedProject(null); // Deselect project
-         setCurrentView("home"); // Navigate back to the home/project list view
-         // The HomePage component, when re-rendered, will fetch the updated project list
-     } catch (err) {
-          console.error("Failed to delete project:", err);
-          displayFeedback(`Error deleting project: ${err}`, "error");
-     }
-  }, [displayFeedback]);
+    // 1. Does this confirmation dialog show up?
+    if (!window.confirm(`Are you sure you want to delete project "${projectName}"? This cannot be undone.`)) {
+        return; // If you click Cancel, it stops here.
+    }
+
+    // 2. Is this feedback message shown?
+    displayFeedback(`Deleting project ${projectName}...`, "success");
+    try {
+        // 3. Is the invoke call happening? Check browser console for related errors.
+        console.log(`Invoking delete_project for: ${projectName}`); // Add log
+        await invoke("delete_project", { name: projectName });
+
+        // 4. Does execution reach here on success?
+        console.log(`Successfully invoked delete_project for: ${projectName}`); // Add log
+        displayFeedback(`Project '${projectName}' deleted.`, "success");
+        setSelectedProject(null);
+        setCurrentView("home");
+        // Note: HomePage should automatically refetch the project list when it mounts/renders
+    } catch (err) {
+        // 5. If it fails, is an error logged here and displayed?
+        console.error("Failed to delete project via invoke:", err);
+        displayFeedback(`Error deleting project: ${err}`, "error");
+    }
+}, [displayFeedback]); // Dependencies look correct
+
+
 
   // --- Render Logic ---
   const renderContent = () => {

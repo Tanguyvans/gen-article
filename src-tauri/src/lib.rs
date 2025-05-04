@@ -1,6 +1,9 @@
 use langchain_rust::language_models::llm::LLM;
 use langchain_rust::llm::openai::OpenAI;
 use langchain_rust::llm::OpenAIConfig;
+use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::multipart;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,6 +38,34 @@ struct ArticleRequest {
 #[derive(Serialize, Debug)]
 struct ArticleResponse {
     article_text: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct ImageGenRequest {
+    prompt: String,
+    rendering_speed: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct IdeogramApiResponse {
+    created: Option<String>,
+    data: Option<Vec<IdeogramImageData>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct IdeogramImageData {
+    is_image_safe: Option<bool>,
+    prompt: Option<String>,
+    resolution: Option<String>,
+    seed: Option<u64>,
+    style_type: Option<String>,
+    url: String,
+}
+
+#[derive(Serialize, Debug)]
+struct ImageGenResponse {
+    image_url: Option<String>,
+    error: Option<String>,
 }
 
 #[tauri::command]
@@ -185,27 +216,58 @@ async fn save_project_settings(
 
 #[tauri::command]
 async fn delete_project(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    println!("Rust: Attempting to delete project '{}'", name);
     let store_result = app.store(PathBuf::from(STORE_FILE));
     match store_result {
         Ok(s) => {
-            s.reload()
-                .map_err(|e| format!("Failed to load store: {}", e))?;
-            let mut projects = get_projects_from_store(&s)?;
+            println!("Rust: Store accessed for deletion.");
+            s.reload().map_err(|e| {
+                let err_msg = format!("Failed to load store: {}", e);
+                println!("Rust: Error - {}", &err_msg);
+                err_msg
+            })?;
 
+            let mut projects = get_projects_from_store(&s).map_err(|e| {
+                println!("Rust: Error getting projects from store: {}", e);
+                e
+            })?;
+            println!("Rust: Projects map loaded. Size: {}", projects.len());
+
+            // Remove the project
             if projects.remove(&name).is_none() {
+                println!("Rust: Project '{}' not found in map.", name);
                 return Err(format!("Project '{}' not found.", name));
             }
+            println!("Rust: Project '{}' removed from map.", name);
 
-            s.set(
-                STORE_KEY_PROJECTS.to_string(),
-                serde_json::to_value(projects).unwrap(),
-            );
+            // Serialize the updated map back to JsonValue
+            let updated_projects_value = serde_json::to_value(&projects).map_err(|e| {
+                let err_msg = format!("Failed to serialize updated projects map: {}", e);
+                println!("Rust: Error - {}", &err_msg);
+                err_msg
+            })?;
 
-            s.save()
-                .map_err(|e| format!("Failed to save store: {}", e))?;
+            // Set the modified map back into the store (No error handling here, as set returns ())
+            s.set(STORE_KEY_PROJECTS.to_string(), updated_projects_value);
+            // REMOVED: .map_err(|e| { ... })?;
+
+            println!("Rust: Updated projects map set in store (in memory).");
+
+            // Save the store to persist the changes (Error handled here)
+            s.save().map_err(|e| {
+                let err_msg = format!("Failed to save store after deletion: {}", e);
+                println!("Rust: Error - {}", &err_msg);
+                err_msg
+            })?;
+
+            println!("Rust: Store saved successfully after deleting '{}'.", name);
             Ok(())
         }
-        Err(e) => Err(format!("Failed to access store: {}", e)),
+        Err(e) => {
+            let err_msg = format!("Failed to access store: {}", e);
+            println!("Rust: Error - {}", &err_msg);
+            Err(err_msg)
+        }
     }
 }
 
@@ -260,6 +322,92 @@ async fn generate_article(
     })
 }
 
+#[tauri::command]
+async fn generate_ideogram_image(
+    app: tauri::AppHandle,
+    request: ImageGenRequest,
+) -> Result<ImageGenResponse, String> {
+    println!(
+        "Rust: Received image generation request for prompt: {}",
+        request.prompt
+    );
+
+    let api_key = get_api_key(app.clone(), STORE_KEY_IMAGE_API.to_string())
+        .await?
+        .ok_or_else(|| "Ideogram API Key (imageApiKey) not found in store.".to_string())?;
+
+    let api_endpoint = "https://api.ideogram.ai/v1/ideogram-v3/generate";
+    let client = Client::new();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Api-Key",
+        HeaderValue::from_str(&api_key).map_err(|e| format!("Invalid API Key format: {}", e))?,
+    );
+
+    let mut form = multipart::Form::new().text("prompt", request.prompt);
+    if let Some(speed) = request.rendering_speed {
+        form = form.text("rendering_speed", speed);
+    } else {
+        form = form.text("rendering_speed", "TURBO");
+    }
+
+    println!(
+        "Rust: Sending multipart request to Ideogram API: {}",
+        api_endpoint
+    );
+    let response = client
+        .post(api_endpoint)
+        .headers(headers)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to Ideogram API: {}", e))?;
+
+    let status = response.status();
+    println!(
+        "Rust: Received response from Ideogram API (Status: {})",
+        status
+    );
+
+    if status.is_success() {
+        let api_response = response
+            .json::<IdeogramApiResponse>()
+            .await
+            .map_err(|e| format!("Failed to parse Ideogram JSON response: {}", e))?;
+
+        println!("Rust: Parsed Ideogram success response: {:?}", api_response);
+
+        if let Some(data_vec) = api_response.data {
+            if let Some(first_result) = data_vec.first() {
+                println!("Rust: Found image URL: {}", first_result.url);
+                return Ok(ImageGenResponse {
+                    image_url: Some(first_result.url.clone()),
+                    error: None,
+                });
+            } else {
+                println!("Rust: Ideogram response successful but 'data' array is empty.");
+                return Err("Ideogram response 'data' array was empty.".to_string());
+            }
+        } else {
+            println!("Rust: Ideogram response successful but 'data' field missing or null.");
+            return Err("Ideogram response missing 'data' field.".to_string());
+        }
+    } else {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Could not read error body".to_string());
+        println!(
+            "Rust: Ideogram API request failed - Status: {}, Body: {}",
+            status, error_text
+        );
+        Err(format!(
+            "Ideogram API request failed with status {}: {}",
+            status, error_text
+        ))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -274,7 +422,8 @@ pub fn run() {
             get_project_settings,
             save_project_settings,
             delete_project,
-            generate_article
+            generate_article,
+            generate_ideogram_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
