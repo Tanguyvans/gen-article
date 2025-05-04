@@ -11,24 +11,24 @@ import ProjectPage from './pages/ProjectPage';
 
 // --- Types ---
 export type View = "home" | "settings"; // Export View type if needed by children
-export type DisplayFeedback = (message: string, type: "success" | "error") => void; // Export helper type
+// Updated type definition to include 'warning'
+export type FeedbackType = "success" | "error" | "warning";
+export type DisplayFeedback = (message: string, type: FeedbackType) => void; // Export helper type
 
 // --- Main App Component ---
 function App() {
   // --- State ---
   const [currentView, setCurrentView] = useState<View>("home");
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  // Use a single state object for feedback messages
+  const [feedback, setFeedback] = useState<{ message: string | null; type: FeedbackType | null }>({ message: null, type: null });
 
   // --- Callbacks ---
   const displayFeedback: DisplayFeedback = useCallback((message, type) => {
-    if (type === "success") setSuccessMsg(message);
-    else setErrorMsg(message);
+    setFeedback({ message, type });
     setTimeout(() => {
-      setSuccessMsg(null);
-      setErrorMsg(null);
-    }, 4000);
+      setFeedback({ message: null, type: null });
+    }, 4000); // Keep timeout duration
   }, []);
 
   const handleNavigate = useCallback((view: View) => {
@@ -38,39 +38,31 @@ function App() {
 
   const handleProjectSelect = useCallback((projectName: string | null) => {
     setSelectedProject(projectName);
-    if (projectName) {
-        // Optional: Decide if selecting a project always forces the view to 'home'
-        // setCurrentView("home");
-    }
+    // Optional: Automatically navigate or stay on current view based on logic
+    // if (projectName) {
+    //    setCurrentView("home"); // Example: force home view when project selected
+    // }
   }, []);
 
   const handleProjectDelete = useCallback(async (projectName: string) => {
-    // 1. Does this confirmation dialog show up?
     if (!window.confirm(`Are you sure you want to delete project "${projectName}"? This cannot be undone.`)) {
-        return; // If you click Cancel, it stops here.
+        return;
     }
-
-    // 2. Is this feedback message shown?
-    displayFeedback(`Deleting project ${projectName}...`, "success");
+    // Use 'warning' type for actions in progress if desired, or keep 'success'
+    displayFeedback(`Deleting project ${projectName}...`, "warning");
     try {
-        // 3. Is the invoke call happening? Check browser console for related errors.
-        console.log(`Invoking delete_project for: ${projectName}`); // Add log
+        console.log(`Invoking delete_project for: ${projectName}`);
         await invoke("delete_project", { name: projectName });
-
-        // 4. Does execution reach here on success?
-        console.log(`Successfully invoked delete_project for: ${projectName}`); // Add log
+        console.log(`Successfully invoked delete_project for: ${projectName}`);
         displayFeedback(`Project '${projectName}' deleted.`, "success");
-        setSelectedProject(null);
-        setCurrentView("home");
-        // Note: HomePage should automatically refetch the project list when it mounts/renders
+        setSelectedProject(null); // Deselect project
+        setCurrentView("home"); // Go back to home view
+        // Note: HomePage should refetch projects automatically on next render
     } catch (err) {
-        // 5. If it fails, is an error logged here and displayed?
         console.error("Failed to delete project via invoke:", err);
         displayFeedback(`Error deleting project: ${err}`, "error");
     }
-}, [displayFeedback]); // Dependencies look correct
-
-
+  }, [displayFeedback]); // Dependency array includes displayFeedback
 
   // --- Render Logic ---
   const renderContent = () => {
@@ -81,36 +73,39 @@ function App() {
     // Handle 'home' view state
     if (currentView === "home") {
       if (selectedProject) {
-        // If a project is selected within the 'home' context, show its details/page
+        // Show ProjectPage if a project is selected
         return (
           <ProjectPage
             projectName={selectedProject}
             displayFeedback={displayFeedback}
-            onBack={() => handleProjectSelect(null)} // Callback to deselect project
+            onBack={() => handleProjectSelect(null)} // Go back to project list
             onDelete={handleProjectDelete} // Pass delete handler
           />
         );
       } else {
-        // If no project is selected, show the main home page (project list/creation)
+        // Show HomePage (project list/creation) if no project is selected
         return (
           <HomePage
             displayFeedback={displayFeedback}
-            onProjectSelect={handleProjectSelect} // Callback to select a project
+            onProjectSelect={handleProjectSelect} // Pass select handler
           />
         );
-  }
+      }
     }
-    // Fallback or loading state if needed
-    return <div>Loading...</div>;
+    // Fallback content if needed
+    return <div>Loading view...</div>;
   };
+
+  // Determine feedback class based on type
+  const feedbackClass = feedback.type ? `feedback ${feedback.type}` : 'feedback';
 
   return (
     <div className="app-layout">
       <Sidebar navigateTo={handleNavigate} currentView={currentView} />
       <main className="content-area">
-        {/* Feedback Area */}
-        {errorMsg && <div className="feedback error">{errorMsg}</div>}
-        {successMsg && <div className="feedback success">{successMsg}</div>}
+        {/* Updated Feedback Area */}
+        {feedback.message && <div className={feedbackClass}>{feedback.message}</div>}
+
         {/* Render the current page content */}
         {renderContent()}
     </main>

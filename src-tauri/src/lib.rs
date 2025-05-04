@@ -2,19 +2,21 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::multipart;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tauri::{Manager, Wry};
-use tauri_plugin_store::{JsonValue, Store, StoreBuilder, StoreExt};
+use tauri::Manager;
+use tauri_plugin_store::{JsonValue, StoreExt};
 
 const STORE_FILE: &str = ".settings.dat";
 
 const STORE_KEY_TEXT_API: &str = "textApiKey";
 const STORE_KEY_IMAGE_API: &str = "imageApiKey";
 const STORE_KEY_PROJECTS: &str = "projects";
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+struct SectionDefinitionData {
+    instructions: String,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 struct ProjectSettings {
@@ -25,7 +27,13 @@ struct ProjectSettings {
     #[serde(default)]
     wordpress_pass: String,
     #[serde(default)]
-    generation_prompt: String,
+    tool_name: String,
+    #[serde(default)]
+    article_goal_prompt: String,
+    #[serde(default)]
+    example_url: String,
+    #[serde(default)]
+    sections: Vec<SectionDefinitionData>,
 }
 
 type ProjectsMap = HashMap<String, ProjectSettings>;
@@ -103,41 +111,27 @@ struct OpenAiV1Content {
 }
 
 #[derive(serde::Deserialize, Debug)]
-struct SectionRequest {
-    instructions: String,
-}
-
-#[derive(serde::Deserialize, Debug)]
 struct FullArticleRequest {
     tool_name: String,
-    sections: Vec<SectionRequest>,
-}
-
-#[derive(Serialize)]
-struct OpenAiRequestBody {
-    model: String,
-    input: String,
-    tools: Vec<OpenAiTool>,
+    article_goal_prompt: String,
+    example_url: String,
+    sections: Vec<SectionDefinitionData>,
 }
 
 #[derive(Deserialize, Debug)]
 struct OpenAiMessage {
-    role: Option<String>, // Role might be optional depending on usage
+    role: Option<String>,
     content: String,
 }
 
 #[derive(Deserialize, Debug)]
 struct OpenAiApiResponseChoice {
-    message: OpenAiMessage, // Contains the actual content
+    message: OpenAiMessage,
 }
 
 #[derive(Deserialize, Debug)]
 struct OpenAiApiResponse {
     choices: Vec<OpenAiApiResponseChoice>,
-}
-
-struct StoreState {
-    store: Arc<Store<Wry>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -192,8 +186,12 @@ fn get_projects_from_store(
     store: &tauri_plugin_store::Store<tauri::Wry>,
 ) -> Result<ProjectsMap, String> {
     match store.get(STORE_KEY_PROJECTS) {
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|e| format!("Failed to deserialize projects: {}", e)),
+        Some(value) => serde_json::from_value(value.clone()).map_err(|e| {
+            format!(
+                "Failed to deserialize projects: {}. Value was: {}",
+                e, value
+            )
+        }),
         None => Ok(ProjectsMap::new()),
     }
 }
@@ -539,6 +537,8 @@ async fn generate_full_article(
     app: tauri::AppHandle,
 ) -> Result<ArticleResponse, String> {
     println!("Generating full article for tool: {}", request.tool_name);
+    println!("Using article goal: {}", request.article_goal_prompt);
+    println!("Using example URL: {}", request.example_url);
     println!(
         "Received sections (instructions only): {:?}",
         request.sections
@@ -554,11 +554,12 @@ async fn generate_full_article(
 
     let mut dynamic_sections_prompt_part = String::new();
     for (index, section) in request.sections.iter().enumerate() {
-        let section_str = format!("Section {} (H2):\n{}\n\n", index + 1, section.instructions);
+        let section_str = format!("Section {}:\n{}\n\n", index + 1, section.instructions);
         dynamic_sections_prompt_part.push_str(&section_str);
     }
 
-    let base_prompt_skeleton = r#"Je souhaite créer des pages pour un site web en français répertoriant des outils d'intelligence artificielle, similaires à l'article de référence https://www.blog-and-blues.org/quickads/. L'article doit se concentrer sur un outil IA spécifique ({TOOL_NAME}) et suivre une structure précise. Vous devez :
+    let final_prompt = format!(
+        r#"{user_goal_prompt} Use {example_url} as a reference for style and structure where applicable. The article must focus on the AI tool: {tool_name}.
 
 Recherche approfondie :
 Analyser le site officiel de l'outil, les discussions pertinentes sur X.com, et des sources web fiables pour collecter des informations à jour sur les fonctionnalités, tarifs, avis utilisateurs, et alternatives.
@@ -566,24 +567,26 @@ Vérifier les données pour 2025 afin d'assurer leur actualité et leur précisi
 Éviter toute confusion avec des outils similaires (ex. Groq vs Grok).
 
 Structure de l'article :
-{DYNAMIC_SECTIONS}
+Based on the instructions below, create distinct sections with appropriate H2 titles.
+{dynamic_sections}
 
 Rédaction :
 Produire un article de minimum 1000 mots en HTML, incluant :
-Balise <title> : Optimisée pour le SEO, 60-70 caractères, avec des mots-clés comme "avis", "fonctionnalités", "tarifs", "{TOOL_NAME}", "2025" (ex. "Avis {TOOL_NAME} 2025 : fonctionnalités, tarifs, alternatives").
-Balise <meta description> : 150-160 caractères, incluant un call-to-action engageant (ex. "Découvrez {TOOL_NAME} : fonctionnalités, tarifs, avis. Boostez vos projets IA !").
-Balise <h1> : Optimisée pour le lecteur, engageante, différente du <title>, axée sur un bénéfice clé (ex. "Pourquoi {TOOL_NAME} révolutionne vos projets IA en 2025").
-Balises H2: Utilisez des titres H2 descriptifs pour chaque section demandée dans DYNAMIC_SECTIONS. Vous devrez générer ces titres H2 vous-même en vous basant sur les instructions de chaque section.
+Balise <title> : Optimisée pour le SEO, 60-70 caractères, avec des mots-clés comme "avis", "fonctionnalités", "tarifs", "{tool_name}", "2025" (ex. "Avis {tool_name} 2025 : fonctionnalités, tarifs, alternatives").
+Balise <meta description> : 150-160 caractères, incluant un call-to-action engageant (ex. "Découvrez {tool_name} : fonctionnalités, tarifs, avis. Boostez vos projets IA !").
+Balise <h1> : Optimisée pour le lecteur, engageante, différente du <title>, axée sur un bénéfice clé (ex. "Pourquoi {tool_name} révolutionne vos projets IA en 2025").
+Balises H2: Générez des titres H2 descriptifs et pertinents pour chaque section définie ci-dessus en vous basant sur les instructions fournies pour cette section.
 Liens hypertextes : Inclure un lien vers le site officiel de l'outil dans l'introduction, les tarifs, et la conclusion, et des liens vers les sites des alternatives dans la section correspondante. Ne pas inclure de liens vers des sources de recherche.
 Style CSS : Intégré dans la balise <style> pour un tableau esthétique (bordures, couleurs alternées, padding) et une mise en page lisible (polices claires, espacement).
 Respecter les conventions typographiques françaises : minuscules sauf pour débuts de phrases, titres, et noms propres.
 Utiliser un ton engageant, professionnel, et accessible, avec des exemples concrets pour illustrer les cas d'usage.
 Assurez-vous que la sortie est uniquement le code HTML complet de l'article, en commençant par <!DOCTYPE html> ou <html> et se terminant par </html>. N'incluez AUCUN texte ou explication avant ou après le code HTML.
-"#;
-
-    let final_prompt = base_prompt_skeleton
-        .replace("{TOOL_NAME}", &request.tool_name)
-        .replace("{DYNAMIC_SECTIONS}", &dynamic_sections_prompt_part);
+"#,
+        user_goal_prompt = request.article_goal_prompt,
+        example_url = request.example_url,
+        tool_name = request.tool_name,
+        dynamic_sections = dynamic_sections_prompt_part
+    );
 
     println!(
         "--- Final Prompt Being Sent ---\n{}\n--- End Final Prompt ---",
@@ -668,52 +671,36 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .setup(|app| {
             let handle = app.handle().clone();
-
-            let app_data_dir = match handle.path().app_data_dir() {
-                Ok(path) => path,
-                Err(e) => {
-                    eprintln!("FATAL: Failed to get app data directory: {}", e);
-                    return Err(Box::new(e) as Box<dyn std::error::Error>);
-                }
-            };
-            let store_path = app_data_dir.join("settings.json");
+            let app_data_dir = handle
+                .path()
+                .app_data_dir()
+                .expect("Failed to get app data dir");
+            let store_path = app_data_dir.join(STORE_FILE);
             println!("Store path: {:?}", store_path);
 
-            let store_result = StoreBuilder::new(&handle, store_path.clone()).build();
-
-            let store = match store_result {
-                Ok(s) => {
-                    println!("Store built successfully.");
-                    s
-                }
-                Err(e) => {
-                    eprintln!("FATAL: Failed to build store: {}", e);
-                    return Err(Box::new(e) as Box<dyn std::error::Error>);
-                }
-            };
-
-            if store_path.exists() {
-                match store.reload() {
-                    Ok(_) => println!("Store reloaded successfully."),
-                    Err(e) => {
-                        eprintln!("Error reloading existing store: {}", e);
-                        return Err(Box::new(e) as Box<dyn std::error::Error>);
+            match app.store(store_path.clone()) {
+                Ok(store) => {
+                    if !store_path.exists() {
+                        println!("Store file not found at {:?}, initializing...", store_path);
+                        store.set(STORE_KEY_TEXT_API.to_string(), JsonValue::Null);
+                        store.set(STORE_KEY_IMAGE_API.to_string(), JsonValue::Null);
+                        store.set(
+                            STORE_KEY_PROJECTS.to_string(),
+                            serde_json::to_value(ProjectsMap::new()).unwrap_or(JsonValue::Null),
+                        );
+                        store.save().expect("Failed to save initialized store");
+                        println!("Store initialized and saved.");
+                    } else {
+                        store.reload().unwrap_or_else(|e| {
+                            eprintln!("Error reloading existing store during setup: {}", e)
+                        });
+                        println!("Existing store found at {:?}.", store_path);
                     }
                 }
-            } else {
-                println!("Store file not found at {:?}, initializing...", store_path);
-                store.set("api_keys".to_string(), json!(ApiKeys::default()));
-                store.set(
-                    "projects".to_string(),
-                    json!(HashMap::<String, ProjectSettings>::new()),
-                );
-                store.save().map_err(|e| {
-                    eprintln!("Failed to save initialized store: {}", e);
-                    Box::new(e) as Box<dyn std::error::Error>
-                })?;
-                println!("Store initialized and saved.");
+                Err(e) => {
+                    panic!("Failed to access or build store during setup: {}", e);
+                }
             }
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -724,7 +711,6 @@ pub fn run() {
             get_project_settings,
             save_project_settings,
             delete_project,
-            generate_article,
             generate_ideogram_image,
             generate_full_article
         ])
