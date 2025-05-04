@@ -1,5 +1,7 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+// REMOVE Tauri dialog import if it's still there
+// import { ask } from '@tauri-apps/api/dialog';
 import "./App.css";
 
 // --- Child Component Imports ---
@@ -44,25 +46,30 @@ function App() {
     // }
   }, []);
 
+  // --- Updated Delete Callback - REMOVED Confirmation ---
   const handleProjectDelete = useCallback(async (projectName: string) => {
-    if (!window.confirm(`Are you sure you want to delete project "${projectName}"? This cannot be undone.`)) {
-        return;
-    }
-    // Use 'warning' type for actions in progress if desired, or keep 'success'
-    displayFeedback(`Deleting project ${projectName}...`, "warning");
+    console.log(`[App] handleProjectDelete initiated for: ${projectName}`);
+
+    // --- REMOVED Confirmation Dialog ---
+    // const confirmed = await ask(...);
+    // if (!confirmed) { ... return; }
+
+    console.log(`[App] Proceeding directly with deletion for: ${projectName}.`);
+    displayFeedback(`Deleting project ${projectName}...`, "warning"); // Show feedback immediately
     try {
-        console.log(`Invoking delete_project for: ${projectName}`);
+        console.log(`[App] Invoking delete_project for: ${projectName}`);
         await invoke("delete_project", { name: projectName });
-        console.log(`Successfully invoked delete_project for: ${projectName}`);
+        console.log(`[App] Successfully invoked delete_project for: ${projectName}`);
+
         displayFeedback(`Project '${projectName}' deleted.`, "success");
         setSelectedProject(null); // Deselect project
-        setCurrentView("home"); // Go back to home view
-        // Note: HomePage should refetch projects automatically on next render
+        setCurrentView("home"); // Navigate back to home view
     } catch (err) {
-        console.error("Failed to delete project via invoke:", err);
-        displayFeedback(`Error deleting project: ${err}`, "error");
+        console.error("[App] Failed to delete project via invoke:", err);
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        displayFeedback(`Error deleting project: ${errorMsg}`, "error");
     }
-  }, [displayFeedback]); // Dependency array includes displayFeedback
+  }, [displayFeedback]); // Keep dependency
 
   // --- Render Logic ---
   const renderContent = () => {

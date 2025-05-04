@@ -1,4 +1,4 @@
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::multipart;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -311,27 +311,21 @@ async fn delete_project(app: tauri::AppHandle, name: String) -> Result<(), Strin
             })?;
             println!("Rust: Projects map loaded. Size: {}", projects.len());
 
-            // Remove the project
             if projects.remove(&name).is_none() {
                 println!("Rust: Project '{}' not found in map.", name);
                 return Err(format!("Project '{}' not found.", name));
             }
             println!("Rust: Project '{}' removed from map.", name);
 
-            // Serialize the updated map back to JsonValue
             let updated_projects_value = serde_json::to_value(&projects).map_err(|e| {
                 let err_msg = format!("Failed to serialize updated projects map: {}", e);
                 println!("Rust: Error - {}", &err_msg);
                 err_msg
             })?;
 
-            // Set the modified map back into the store (No error handling here, as set returns ())
             s.set(STORE_KEY_PROJECTS.to_string(), updated_projects_value);
-            // REMOVED: .map_err(|e| { ... })?;
-
             println!("Rust: Updated projects map set in store (in memory).");
 
-            // Save the store to persist the changes (Error handled here)
             s.save().map_err(|e| {
                 let err_msg = format!("Failed to save store after deletion: {}", e);
                 println!("Rust: Error - {}", &err_msg);
@@ -346,102 +340,6 @@ async fn delete_project(app: tauri::AppHandle, name: String) -> Result<(), Strin
             println!("Rust: Error - {}", &err_msg);
             Err(err_msg)
         }
-    }
-}
-
-#[tauri::command]
-async fn generate_article(
-    app: tauri::AppHandle,
-    request: ArticleRequest,
-) -> Result<ArticleResponse, String> {
-    let api_key = get_api_key(app.clone(), STORE_KEY_TEXT_API.to_string())
-        .await?
-        .ok_or_else(|| "OpenAI API Key (textApiKey) not found in store.".to_string())?;
-
-    let api_endpoint = "https://api.openai.com/v1/responses";
-    let client = Client::new();
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", api_key))
-            .map_err(|e| format!("Invalid OpenAI API Key format: {}", e))?,
-    );
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-    let input_prompt = format!(
-        "Answer the question with the most recent data available on the internet '{topic}'",
-        topic = request.topic
-    );
-
-    let tools = [OpenAiTool {
-        tool_type: "web_search_preview".to_string(),
-    }];
-
-    let request_body = OpenAiRequestPayload {
-        model: "gpt-4o",
-        tools: &tools,
-        input: &input_prompt,
-    };
-
-    println!("Sending prompt to OpenAI API with web search...");
-    let response = client
-        .post(api_endpoint)
-        .headers(headers)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to send request to OpenAI API: {}", e))?;
-
-    let status = response.status();
-    println!("Received response from OpenAI API (Status: {})", status);
-
-    if status.is_success() {
-        let raw_body = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read OpenAI response body: {}", e))?;
-        println!("--- RAW OpenAI Response Body START ---");
-        println!("{}", raw_body);
-        println!("--- RAW OpenAI Response Body END ---");
-
-        let api_response: OpenAiV1Response = serde_json::from_str(&raw_body).map_err(|e| {
-            let err_msg = format!(
-                "Failed to parse OpenAI JSON response: {}. Raw body was: {}",
-                e, raw_body
-            );
-            println!("Rust Error: {}", err_msg);
-            err_msg
-        })?;
-
-        println!("Parsed OpenAI success response struct (using /v1/responses format).");
-
-        if let Some(output_item) = api_response.output.first() {
-            if let Some(content_item) = output_item.content.first() {
-                if content_item.content_type == "output_text" {
-                    println!("OpenAI response content found in output.");
-                    return Ok(ArticleResponse {
-                        article_text: content_item.text.clone(),
-                    });
-                }
-            }
-        }
-
-        println!("OpenAI response parsed but expected content structure (output[0].content[0].text) not found.");
-        Err("OpenAI response structure unexpected after parsing.".to_string())
-    } else {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Could not read error body".to_string());
-        println!(
-            "OpenAI API request failed - Status: {}, Body: {}",
-            status, error_text
-        );
-        Err(format!(
-            "OpenAI API request failed with status {}: {}",
-            status, error_text
-        ))
     }
 }
 

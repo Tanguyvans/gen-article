@@ -203,6 +203,8 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   };
 
   const handleDeleteClick = () => {
+      console.log(`[ProjectPage] handleDeleteClick called for: ${projectName}`);
+      alert(`[ProjectPage] handleDeleteClick called for: ${projectName}. Now calling onDelete prop.`); // Add alert as backup
       onDelete(projectName); // Call the delete handler passed from App
   };
 
