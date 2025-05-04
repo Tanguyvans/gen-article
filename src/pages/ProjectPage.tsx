@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, FormEvent, ChangeEvent } from 'react';
+import { useState, useEffect, useCallback, FormEvent, ChangeEvent } from 'react';
 import { invoke } from "@tauri-apps/api/core";
 import { DisplayFeedback } from '../App'; // Import type
 
@@ -30,7 +30,6 @@ interface SectionDefinition {
 // Assuming backend expects this structure later
 interface FullArticleRequest {
     tool_name: string;
-    tool_url: string | null;
     sections: Omit<SectionDefinition, 'id'>[]; // Send title/instructions only
 }
 
@@ -54,7 +53,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
 
   // --- New State for Section-Based Generation ---
   const [toolName, setToolName] = useState("");
-  const [toolUrl, setToolUrl] = useState("");
   const [sectionDefinitions, setSectionDefinitions] = useState<SectionDefinition[]>([
       // Start with one default section
       { id: getNewSectionId(), title: "Introduction", instructions: "Write an engaging introduction for [Tool Name]..." }
@@ -181,7 +179,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
       // Prepare payload for the backend
       const requestPayload: FullArticleRequest = {
           tool_name: toolName,
-          tool_url: toolUrl.trim() || null,
           sections: sectionDefinitions.map(({ id, ...rest }) => rest),
       };
 
@@ -292,14 +289,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                        onChange={(e) => setToolName(e.target.value)}
                        placeholder="Enter the name of the AI tool" required disabled={isGenerating}
                      />
-                </div>
-                <div className="row">
-                    <label htmlFor="toolUrl">Tool URL (Optional):</label>
-                    <input
-                       id="toolUrl" type="url" value={toolUrl}
-                       onChange={(e) => setToolUrl(e.target.value)}
-                       placeholder="https://example.com" disabled={isGenerating}
-                    />
                 </div>
 
                 {/* Dynamic Section Inputs */}

@@ -2,9 +2,13 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::multipart;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tauri_plugin_store::{JsonValue, StoreExt};
+use std::sync::Arc;
+use tauri::{Manager, Wry};
+use tauri_plugin_store::{JsonValue, Store, StoreBuilder, StoreExt};
 
 const STORE_FILE: &str = ".settings.dat";
 
@@ -96,6 +100,53 @@ struct OpenAiV1Content {
     #[serde(rename = "type")]
     content_type: String,
     text: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct SectionRequest {
+    title: String,
+    instructions: String,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct FullArticleRequest {
+    tool_name: String,
+    sections: Vec<SectionRequest>,
+}
+
+#[derive(Serialize)]
+struct OpenAiRequestBody {
+    model: String,
+    input: String,
+    tools: Vec<OpenAiTool>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiMessage {
+    role: Option<String>, // Role might be optional depending on usage
+    content: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiApiResponseChoice {
+    message: OpenAiMessage, // Contains the actual content
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiApiResponse {
+    choices: Vec<OpenAiApiResponseChoice>,
+}
+
+struct StoreState {
+    store: Arc<Store<Wry>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+struct ApiKeys {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    openai_api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ideogram_api_key: Option<String>,
 }
 
 #[tauri::command]
@@ -483,11 +534,193 @@ async fn generate_ideogram_image(
     }
 }
 
+#[tauri::command]
+async fn generate_full_article(
+    request: FullArticleRequest,
+    state: tauri::State<'_, StoreState>,
+) -> Result<ArticleResponse, String> {
+    println!("Generating full article for tool: {}", request.tool_name);
+    println!("Received sections: {:?}", request.sections);
+
+    let mut dynamic_sections_prompt_part = String::new();
+    for (index, section) in request.sections.iter().enumerate() {
+        let section_str = format!(
+            "Section {} (H2): Titre \"{}\"\n{}\n\n",
+            index + 1,
+            section.title,
+            section.instructions
+        );
+        dynamic_sections_prompt_part.push_str(&section_str);
+    }
+
+    let base_prompt_skeleton = r#"Je souhaite créer des pages pour un site web en français répertoriant des outils d'intelligence artificielle, similaires à l'article de référence https://www.blog-and-blues.org/quickads/. L'article doit se concentrer sur un outil IA spécifique ({TOOL_NAME}) et suivre une structure précise. Vous devez :
+
+Recherche approfondie :
+Analyser le site officiel de l'outil, les discussions pertinentes sur X.com, et des sources web fiables pour collecter des informations à jour sur les fonctionnalités, tarifs, avis utilisateurs, et alternatives.
+Vérifier les données pour 2025 afin d'assurer leur actualité et leur précision.
+Éviter toute confusion avec des outils similaires (ex. Groq vs Grok).
+
+Structure de l'article :
+{DYNAMIC_SECTIONS}
+
+Rédaction :
+Produire un article de minimum 1000 mots en HTML, incluant :
+Balise <title> : Optimisée pour le SEO, 60-70 caractères, avec des mots-clés comme "avis", "fonctionnalités", "tarifs", "{TOOL_NAME}", "2025" (ex. "Avis {TOOL_NAME} 2025 : fonctionnalités, tarifs, alternatives").
+Balise <meta description> : 150-160 caractères, incluant un call-to-action engageant (ex. "Découvrez {TOOL_NAME} : fonctionnalités, tarifs, avis. Boostez vos projets IA !").
+Balise <h1> : Optimisée pour le lecteur, engageante, différente du <title>, axée sur un bénéfice clé (ex. "Pourquoi {TOOL_NAME} révolutionne vos projets IA en 2025").
+Liens hypertextes : Inclure un lien vers le site officiel de l'outil dans l'introduction, les tarifs, et la conclusion, et des liens vers les sites des alternatives dans la section correspondante. Ne pas inclure de liens vers des sources de recherche.
+Style CSS : Intégré dans la balise <style> pour un tableau esthétique (bordures, couleurs alternées, padding) et une mise en page lisible (polices claires, espacement).
+Respecter les conventions typographiques françaises : minuscules sauf pour débuts de phrases, titres, et noms propres.
+Utiliser un ton engageant, professionnel, et accessible, avec des exemples concrets pour illustrer les cas d'usage.
+Assurez-vous que la sortie est uniquement le code HTML complet de l'article, en commençant par <!DOCTYPE html> ou <html> et se terminant par </html>. N'incluez AUCUN texte ou explication avant ou après le code HTML.
+"#;
+
+    let final_prompt = base_prompt_skeleton
+        .replace("{TOOL_NAME}", &request.tool_name)
+        .replace("{DYNAMIC_SECTIONS}", &dynamic_sections_prompt_part);
+
+    println!(
+        "--- Final Prompt Being Sent ---\n{}\n--- End Final Prompt ---",
+        final_prompt
+    );
+
+    let api_key: String = "sk-0XA7PH_ZI0Oj3ujAO9NsAD4rv3F-6cS6Kzc1gdANcWT3BlbkFJVEBSiTLr4k8VfAJlXV0KctV8uWucPLJEIovc3XenUA".to_string();
+    println!(
+        "[generate_full_article] Using HARDCODED API Key: {}",
+        &api_key[..10]
+    );
+
+    if api_key.is_empty() {
+        return Err("Hardcoded OpenAI API key is empty".to_string());
+    }
+
+    let client = reqwest::Client::new();
+    let api_url = "https://api.openai.com/v1/chat/completions";
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4-turbo",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant tasked with writing detailed AI tool review articles in French HTML format based on user instructions and web searches."
+            },
+            {
+                "role": "user",
+                "content": final_prompt
+            }
+        ],
+        "temperature": 0.7
+    });
+
+    println!("Sending prompt to OpenAI API...");
+    let response = client
+        .post(api_url)
+        .bearer_auth(&api_key)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to OpenAI: {}", e))?;
+
+    let status = response.status();
+    let response_body_text = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read OpenAI response body: {}", e))?;
+    println!("Received response from OpenAI API (Status: {})", status);
+    println!("Response Body:\n{}", response_body_text);
+
+    if status.is_success() {
+        // Attempt to parse directly into the corrected structure
+        match serde_json::from_str::<OpenAiApiResponse>(&response_body_text) {
+            Ok(parsed_response) => {
+                // Check if choices exist and get the first one
+                if let Some(choice) = parsed_response.choices.get(0) {
+                    println!("Successfully parsed response and extracted content.");
+                    // Access content directly through the nested structs
+                    Ok(ArticleResponse {
+                        article_text: choice.message.content.clone(), // Get content from message
+                    })
+                } else {
+                    // This case should be rare if status is success, but good to handle
+                    println!("OpenAI response successful but 'choices' array is empty.");
+                    Err("OpenAI response has no choices".to_string())
+                }
+            }
+            Err(e) => {
+                // Parsing failed, log the error and the raw body for debugging
+                eprintln!("Detailed parsing error: {:?}", e);
+                eprintln!("Raw response body was:\n{}", response_body_text);
+                Err(format!(
+                    "Failed to parse OpenAI response into expected structure: {}",
+                    e
+                ))
+            }
+        }
+    } else {
+        Err(format!(
+            "OpenAI API request failed with status {}: {}",
+            status, response_body_text
+        ))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
-        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let handle = app.handle().clone();
+
+            let app_data_dir = match handle.path().app_data_dir() {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("FATAL: Failed to get app data directory: {}", e);
+                    return Err(Box::new(e) as Box<dyn std::error::Error>);
+                }
+            };
+            let store_path = app_data_dir.join("settings.json");
+            println!("Store path: {:?}", store_path);
+
+            let store_result = StoreBuilder::new(&handle, store_path.clone()).build();
+
+            let store = match store_result {
+                Ok(s) => {
+                    println!("Store built successfully.");
+                    s
+                }
+                Err(e) => {
+                    eprintln!("FATAL: Failed to build store: {}", e);
+                    return Err(Box::new(e) as Box<dyn std::error::Error>);
+                }
+            };
+
+            if store_path.exists() {
+                match store.reload() {
+                    Ok(_) => println!("Store reloaded successfully."),
+                    Err(e) => {
+                        eprintln!("Error reloading existing store: {}", e);
+                        return Err(Box::new(e) as Box<dyn std::error::Error>);
+                    }
+                }
+            } else {
+                println!("Store file not found at {:?}, initializing...", store_path);
+                store.set("api_keys".to_string(), json!(ApiKeys::default()));
+                store.set(
+                    "projects".to_string(),
+                    json!(HashMap::<String, ProjectSettings>::new()),
+                );
+                store.save().map_err(|e| {
+                    eprintln!("Failed to save initialized store: {}", e);
+                    Box::new(e) as Box<dyn std::error::Error>
+                })?;
+                println!("Store initialized and saved.");
+            }
+
+            app.manage(StoreState { store });
+            println!("StoreState managed.");
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             save_api_key,
             get_api_key,
@@ -497,7 +730,8 @@ pub fn run() {
             save_project_settings,
             delete_project,
             generate_article,
-            generate_ideogram_image
+            generate_ideogram_image,
+            generate_full_article
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
