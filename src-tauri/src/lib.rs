@@ -104,7 +104,6 @@ struct OpenAiV1Content {
 
 #[derive(serde::Deserialize, Debug)]
 struct SectionRequest {
-    title: String,
     instructions: String,
 }
 
@@ -537,19 +536,25 @@ async fn generate_ideogram_image(
 #[tauri::command]
 async fn generate_full_article(
     request: FullArticleRequest,
-    state: tauri::State<'_, StoreState>,
+    app: tauri::AppHandle,
 ) -> Result<ArticleResponse, String> {
     println!("Generating full article for tool: {}", request.tool_name);
-    println!("Received sections: {:?}", request.sections);
+    println!(
+        "Received sections (instructions only): {:?}",
+        request.sections
+    );
+
+    let api_key = get_api_key(app.clone(), STORE_KEY_TEXT_API.to_string())
+        .await?
+        .ok_or_else(|| "OpenAI API Key (textApiKey) not found in store.".to_string())?;
+    println!(
+        "[generate_full_article] Using API Key from store: {}...",
+        &api_key[..10]
+    );
 
     let mut dynamic_sections_prompt_part = String::new();
     for (index, section) in request.sections.iter().enumerate() {
-        let section_str = format!(
-            "Section {} (H2): Titre \"{}\"\n{}\n\n",
-            index + 1,
-            section.title,
-            section.instructions
-        );
+        let section_str = format!("Section {} (H2):\n{}\n\n", index + 1, section.instructions);
         dynamic_sections_prompt_part.push_str(&section_str);
     }
 
@@ -568,6 +573,7 @@ Produire un article de minimum 1000 mots en HTML, incluant :
 Balise <title> : Optimisée pour le SEO, 60-70 caractères, avec des mots-clés comme "avis", "fonctionnalités", "tarifs", "{TOOL_NAME}", "2025" (ex. "Avis {TOOL_NAME} 2025 : fonctionnalités, tarifs, alternatives").
 Balise <meta description> : 150-160 caractères, incluant un call-to-action engageant (ex. "Découvrez {TOOL_NAME} : fonctionnalités, tarifs, avis. Boostez vos projets IA !").
 Balise <h1> : Optimisée pour le lecteur, engageante, différente du <title>, axée sur un bénéfice clé (ex. "Pourquoi {TOOL_NAME} révolutionne vos projets IA en 2025").
+Balises H2: Utilisez des titres H2 descriptifs pour chaque section demandée dans DYNAMIC_SECTIONS. Vous devrez générer ces titres H2 vous-même en vous basant sur les instructions de chaque section.
 Liens hypertextes : Inclure un lien vers le site officiel de l'outil dans l'introduction, les tarifs, et la conclusion, et des liens vers les sites des alternatives dans la section correspondante. Ne pas inclure de liens vers des sources de recherche.
 Style CSS : Intégré dans la balise <style> pour un tableau esthétique (bordures, couleurs alternées, padding) et une mise en page lisible (polices claires, espacement).
 Respecter les conventions typographiques françaises : minuscules sauf pour débuts de phrases, titres, et noms propres.
@@ -584,14 +590,8 @@ Assurez-vous que la sortie est uniquement le code HTML complet de l'article, en 
         final_prompt
     );
 
-    let api_key: String = "sk-0XA7PH_ZI0Oj3ujAO9NsAD4rv3F-6cS6Kzc1gdANcWT3BlbkFJVEBSiTLr4k8VfAJlXV0KctV8uWucPLJEIovc3XenUA".to_string();
-    println!(
-        "[generate_full_article] Using HARDCODED API Key: {}",
-        &api_key[..10]
-    );
-
     if api_key.is_empty() {
-        return Err("Hardcoded OpenAI API key is empty".to_string());
+        return Err("Fetched OpenAI API key is empty".to_string());
     }
 
     let client = reqwest::Client::new();
@@ -602,7 +602,7 @@ Assurez-vous que la sortie est uniquement le code HTML complet de l'article, en 
         "messages": [
             {
                 "role": "system",
-                "content": "You are a helpful assistant tasked with writing detailed AI tool review articles in French HTML format based on user instructions and web searches."
+                "content": "You are a helpful assistant tasked with writing detailed AI tool review articles in French HTML format based on user instructions and web searches. Generate appropriate H2 titles for each section based on the provided instructions."
             },
             {
                 "role": "user",
@@ -627,27 +627,21 @@ Assurez-vous que la sortie est uniquement le code HTML complet de l'article, en 
         .await
         .map_err(|e| format!("Failed to read OpenAI response body: {}", e))?;
     println!("Received response from OpenAI API (Status: {})", status);
-    println!("Response Body:\n{}", response_body_text);
 
     if status.is_success() {
-        // Attempt to parse directly into the corrected structure
         match serde_json::from_str::<OpenAiApiResponse>(&response_body_text) {
             Ok(parsed_response) => {
-                // Check if choices exist and get the first one
                 if let Some(choice) = parsed_response.choices.get(0) {
                     println!("Successfully parsed response and extracted content.");
-                    // Access content directly through the nested structs
                     Ok(ArticleResponse {
-                        article_text: choice.message.content.clone(), // Get content from message
+                        article_text: choice.message.content.clone(),
                     })
                 } else {
-                    // This case should be rare if status is success, but good to handle
                     println!("OpenAI response successful but 'choices' array is empty.");
                     Err("OpenAI response has no choices".to_string())
                 }
             }
             Err(e) => {
-                // Parsing failed, log the error and the raw body for debugging
                 eprintln!("Detailed parsing error: {:?}", e);
                 eprintln!("Raw response body was:\n{}", response_body_text);
                 Err(format!(
@@ -657,6 +651,10 @@ Assurez-vous que la sortie est uniquement le code HTML complet de l'article, en 
             }
         }
     } else {
+        eprintln!(
+            "OpenAI API request failed - Status: {}, Body:\n{}",
+            status, response_body_text
+        );
         Err(format!(
             "OpenAI API request failed with status {}: {}",
             status, response_body_text
@@ -715,9 +713,6 @@ pub fn run() {
                 })?;
                 println!("Store initialized and saved.");
             }
-
-            app.manage(StoreState { store });
-            println!("StoreState managed.");
 
             Ok(())
         })

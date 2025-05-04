@@ -23,14 +23,13 @@ interface ImageGenResponse {
 // Interface for the data needed by the backend command (to be created/updated)
 interface SectionDefinition {
     id: number; // Unique ID for React keys and manipulation
-    title: string;
     instructions: string;
 }
 
 // Assuming backend expects this structure later
 interface FullArticleRequest {
     tool_name: string;
-    sections: Omit<SectionDefinition, 'id'>[]; // Send title/instructions only
+    sections: Omit<SectionDefinition, 'id'>[]; // Send instructions only
 }
 
 interface ProjectPageProps {
@@ -55,7 +54,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   const [toolName, setToolName] = useState("");
   const [sectionDefinitions, setSectionDefinitions] = useState<SectionDefinition[]>([
       // Start with one default section
-      { id: getNewSectionId(), title: "Introduction", instructions: "Write an engaging introduction for [Tool Name]..." }
+      { id: getNewSectionId(), instructions: "Write an engaging introduction for [Tool Name]..." }
   ]);
 
   // --- State for Image Test ---
@@ -119,7 +118,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   const handleAddSection = () => {
       setSectionDefinitions(prev => [
           ...prev,
-          { id: getNewSectionId(), title: `New Section ${prev.length + 1}`, instructions: "" }
+          { id: getNewSectionId(), instructions: "" }
       ]);
   };
 
@@ -147,10 +146,10 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   };
 
   // Handler for changes within a specific section's inputs
-  const handleSectionChange = (idToUpdate: number, field: 'title' | 'instructions', value: string) => {
+  const handleSectionChange = (idToUpdate: number, value: string) => {
     setSectionDefinitions(prev =>
       prev.map(section =>
-        section.id === idToUpdate ? { ...section, [field]: value } : section
+        section.id === idToUpdate ? { ...section, instructions: value } : section
       )
     );
   };
@@ -167,8 +166,8 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
            displayFeedback("Please add at least one section.", "error");
            return;
        }
-       if (sectionDefinitions.some(sec => !sec.title.trim() || !sec.instructions.trim())) {
-           displayFeedback("Please fill in titles and instructions for all sections.", "error");
+       if (sectionDefinitions.some(sec => !sec.instructions.trim())) {
+           displayFeedback("Please fill in instructions for all sections.", "error");
            return;
        }
 
@@ -306,24 +305,12 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                             </div>
                         </div>
                         {/* Section Inputs */}
-                        <div className="row">
-                            <label htmlFor={`section-title-${section.id}`} style={{ minWidth: '100px' }}>Title:</label> {/* Adjusted label width */}
-                            <input
-                               id={`section-title-${section.id}`}
-                               type="text"
-                               value={section.title}
-                               onChange={(e) => handleSectionChange(section.id, 'title', e.target.value)}
-                               placeholder={`Enter title for section ${index + 1}`}
-                               required
-                               disabled={isGenerating}
-                            />
-                        </div>
-                         <div className="row" style={{ alignItems: 'flex-start' }}>
+                        <div className="row" style={{ alignItems: 'flex-start' }}>
                             <label htmlFor={`section-instructions-${section.id}`} style={{ minWidth: '100px' }}>Instructions:</label> {/* Adjusted label width */}
                             <textarea
                                id={`section-instructions-${section.id}`}
                                value={section.instructions}
-                               onChange={(e) => handleSectionChange(section.id, 'instructions', e.target.value)}
+                               onChange={(e) => handleSectionChange(section.id, e.target.value)}
                                rows={5}
                                placeholder={`Enter detailed prompt/instructions for section ${index + 1}...`}
                                required
