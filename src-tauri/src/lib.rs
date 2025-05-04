@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use tauri_plugin_store::{JsonValue, StoreExt};
 
 const STORE_FILE: &str = ".settings.dat";
-const STORE_KEY_GROK_API: &str = "grokApiKey";
+const STORE_KEY_TEXT_API: &str = "textApiKey";
 const STORE_KEY_IMAGE_API: &str = "imageApiKey";
 const STORE_KEY_PROJECTS: &str = "projects";
 
@@ -64,32 +64,54 @@ struct ImageGenResponse {
 }
 
 #[derive(Serialize, Debug)]
-struct GrokMessage {
-    role: String,
-    content: String,
+struct OpenAiResponsesTool {
+    #[serde(rename = "type")]
+    tool_type: String,
 }
 
 #[derive(Serialize, Debug)]
-struct GrokRequestPayload<'a> {
-    messages: &'a [GrokMessage],
-    model: &'a str,
-    temperature: f32,
-    stream: bool,
+struct OpenAiResponsesApiRequest {
+    model: String,
+    input: String,
+    tools: Vec<OpenAiResponsesTool>,
 }
 
 #[derive(Deserialize, Debug)]
-struct GrokResponse {
-    choices: Vec<GrokChoice>,
+#[allow(dead_code)]
+struct OutputTextContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    text: String,
 }
 
 #[derive(Deserialize, Debug)]
-struct GrokChoice {
-    message: GrokResponseMessage,
+#[allow(dead_code)]
+struct OutputMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    role: String,
+    content: Vec<OutputTextContent>,
 }
 
 #[derive(Deserialize, Debug)]
-struct GrokResponseMessage {
-    content: String,
+#[allow(dead_code)]
+struct WebSearchCall {
+    #[serde(rename = "type")]
+    call_type: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum OutputItem {
+    Message(OutputMessage),
+    Search(WebSearchCall),
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(dead_code)]
+struct ResponsesApiResponse {
+    output: Vec<OutputItem>,
 }
 
 #[tauri::command]
@@ -294,16 +316,16 @@ async fn delete_project(app: tauri::AppHandle, name: String) -> Result<(), Strin
 
 #[tauri::command]
 async fn greet(app: tauri::AppHandle) -> String {
-    match get_api_key(app.clone(), STORE_KEY_GROK_API.to_string()).await {
+    match get_api_key(app.clone(), STORE_KEY_TEXT_API.to_string()).await {
         Ok(Some(key)) => {
             let display_key = if key.len() > 5 {
                 format!("{}...", &key[..5])
             } else {
                 key
             };
-            format!("Hello! Found Grok API key starting with: {}", display_key)
+            format!("Hello! Found OpenAI API key starting with: {}", display_key)
         }
-        Ok(None) => "Hello! No Grok API key found in store.".to_string(),
+        Ok(None) => "Hello! No OpenAI API key (textApiKey) found in store.".to_string(),
         Err(e) => format!("Hello! Error getting key: {}", e),
     }
 }
@@ -313,86 +335,90 @@ async fn generate_article(
     app: tauri::AppHandle,
     request: ArticleRequest,
 ) -> Result<ArticleResponse, String> {
-    let api_key = get_api_key(app.clone(), STORE_KEY_GROK_API.to_string())
+    let api_key = get_api_key(app.clone(), STORE_KEY_TEXT_API.to_string())
         .await?
-        .ok_or_else(|| "Grok API Key (grokApiKey) not found in store.".to_string())?;
+        .ok_or_else(|| "OpenAI API Key (textApiKey) not found in store.".to_string())?;
 
-    let api_endpoint = "https://api.x.ai/v1/chat/completions";
+    let user_input_prompt = format!(
+        "Generate a blog post about the topic '{topic}'. Use web search for current information.",
+        topic = request.topic
+    );
+
     let client = Client::new();
+    let api_endpoint = "https://api.openai.com/v1/responses";
 
     let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {}", api_key))
-            .map_err(|e| format!("Invalid Grok API Key format: {}", e))?,
+            .map_err(|e| format!("Invalid API Key format for header: {}", e))?,
     );
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-    let system_message = GrokMessage {
-        role: "system".to_string(),
-        content: "You are a helpful assistant that writes blog posts with image placeholders in the format [[Image of a descriptive caption]].".to_string(),
-    };
-    let user_prompt_content = format!(
-        "Generate a blog post about the topic '{topic}'. \
-        The article should be described as: '{description}'. \
-        Please structure the article well with clear headings. \
-        Crucially, include placeholders for relevant images using the format [[Image of a descriptive caption]]. For example: [[Image of a futuristic cityscape]]. \
-        Ensure the placeholders are naturally integrated where an image would enhance the text.",
-        topic = request.topic,
-        description = request.description
-    );
-    let user_message = GrokMessage {
-        role: "user".to_string(),
-        content: user_prompt_content,
-    };
-    let messages = [system_message, user_message];
-
-    let request_body = GrokRequestPayload {
-        messages: &messages,
-        model: "grok-3-latest",
-        temperature: 0.7,
-        stream: false,
+    let request_payload = OpenAiResponsesApiRequest {
+        model: "gpt-4.1".to_string(),
+        input: user_input_prompt,
+        tools: vec![OpenAiResponsesTool {
+            tool_type: "web_search_preview".to_string(),
+        }],
     };
 
-    println!("Sending prompt to Grok API...");
+    println!("Sending request to OpenAI /v1/responses endpoint (model: gpt-4.1, tool: web_search_preview)...");
+    match serde_json::to_string_pretty(&request_payload) {
+        Ok(json_string) => println!("Request Payload:\n{}", json_string),
+        Err(e) => println!("Error serializing request payload: {}", e),
+    }
+
     let response = client
         .post(api_endpoint)
         .headers(headers)
-        .json(&request_body)
+        .json(&request_payload)
         .send()
         .await
-        .map_err(|e| format!("Failed to send request to Grok API: {}", e))?;
+        .map_err(|e| format!("Failed to send request to OpenAI API: {}", e))?;
 
     let status = response.status();
-    println!("Received response from Grok API (Status: {})", status);
+    let response_text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "Could not read response body".to_string());
+
+    println!("Received response from OpenAI API (Status: {})", status);
+    println!("Response Body:\n{}", response_text);
 
     if status.is_success() {
-        let api_response = response
-            .json::<GrokResponse>()
-            .await
-            .map_err(|e| format!("Failed to parse Grok JSON response: {}", e))?;
-        println!("Parsed Grok success response.");
-        if let Some(choice) = api_response.choices.first() {
-            println!("Grok response content received.");
-            Ok(ArticleResponse {
-                article_text: choice.message.content.clone(),
-            })
+        let api_response: ResponsesApiResponse = serde_json::from_str(&response_text)
+            .map_err(|e| format!("Failed to parse OpenAI /v1/responses JSON structure: {}", e))?;
+
+        println!("Parsed OpenAI /v1/responses success response using correct structure.");
+
+        let mut article_text = String::new();
+        for item in api_response.output {
+            if let OutputItem::Message(msg) = item {
+                if let Some(text_content) = msg.content.into_iter().next() {
+                    article_text = text_content.text;
+                    break;
+                }
+            }
+        }
+
+        if article_text.is_empty() {
+            Err(
+                "Could not find 'message' with 'output_text' content in OpenAI /v1/responses output array."
+                    .to_string(),
+            )
         } else {
-            println!("Grok response successful but 'choices' array was empty.");
-            Err("Grok response 'choices' array was empty.".to_string())
+            println!("Successfully extracted article text.");
+            Ok(ArticleResponse { article_text })
         }
     } else {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Could not read error body".to_string());
         println!(
-            "Grok API request failed - Status: {}, Body: {}",
-            status, error_text
+            "OpenAI API request failed - Status: {}, Body: {}",
+            status, response_text
         );
         Err(format!(
-            "Grok API request failed with status {}: {}",
-            status, error_text
+            "OpenAI API request failed with status {}: {}",
+            status, response_text
         ))
     }
 }
