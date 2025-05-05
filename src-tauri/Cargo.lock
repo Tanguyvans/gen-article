@@ -1515,6 +1515,7 @@ name = "gen-article"
 version = "0.1.0"
 dependencies = [
  "langchain-rust",
+ "mime_guess",
  "regex",
  "reqwest 0.12.15",
  "serde",
@@ -1523,6 +1524,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-store",
+ "tokio",
 ]
 
 [[package]]

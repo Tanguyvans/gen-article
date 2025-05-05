@@ -1,13 +1,14 @@
+use mime_guess;
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::multipart;
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::Manager;
 use tauri_plugin_store::{JsonValue, StoreExt};
+use tokio::time::sleep;
 
 const STORE_FILE: &str = ".settings.dat";
 
@@ -183,6 +184,32 @@ struct WordPressCategory {
     id: u32,
     name: String,
     slug: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct UploadImageRequest {
+    project_name: String,
+    image_urls: Vec<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct ImageUploadResult {
+    original_url: String,
+    success: bool,
+    error: Option<String>,
+    wordpress_media_id: Option<u32>,
+    wordpress_media_url: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct UploadImagesResponse {
+    results: Vec<ImageUploadResult>,
+}
+
+#[derive(Deserialize, Debug)]
+struct WordPressMediaResponse {
+    id: u32,
+    source_url: String,
 }
 
 #[tauri::command]
@@ -423,7 +450,7 @@ async fn generate_ideogram_image(
         HeaderValue::from_str(&api_key).map_err(|e| format!("Invalid API Key format: {}", e))?,
     );
 
-    let mut form = multipart::Form::new().text("prompt", request.prompt);
+    let mut form = reqwest::multipart::Form::new().text("prompt", request.prompt);
 
     if let Some(speed) = request.rendering_speed {
         form = form.text("rendering_speed", speed);
@@ -933,6 +960,229 @@ async fn publish_to_wordpress(
     }
 }
 
+#[tauri::command]
+async fn upload_images_to_wordpress(
+    app: tauri::AppHandle,
+    request: UploadImageRequest,
+) -> Result<UploadImagesResponse, String> {
+    println!(
+        "Rust: Received request to upload {} images for project: {}",
+        request.image_urls.len(),
+        request.project_name
+    );
+
+    let settings = get_project_settings(app.clone(), request.project_name.clone())
+        .await?
+        .ok_or_else(|| format!("Settings not found for project '{}'", request.project_name))?;
+
+    if settings.wordpress_url.trim().is_empty()
+        || settings.wordpress_user.trim().is_empty()
+        || settings.wordpress_pass.trim().is_empty()
+    {
+        return Err(
+            "WordPress URL, User, and Application Password must be configured.".to_string(),
+        );
+    }
+
+    let media_api_url = format!(
+        "{}/wp-json/wp/v2/media",
+        settings.wordpress_url.trim_end_matches('/')
+    );
+    println!("Rust: Uploading media to URL: {}", media_api_url);
+
+    let client = Client::new();
+    let mut upload_results: Vec<ImageUploadResult> = Vec::new();
+
+    for image_url in request.image_urls {
+        println!("Rust: Processing image URL: {}", image_url);
+        let result = process_single_image_upload(
+            &client,
+            &media_api_url,
+            &settings.wordpress_user,
+            &settings.wordpress_pass,
+            &image_url,
+        )
+        .await;
+        upload_results.push(result);
+    }
+
+    println!("Rust: Finished processing all image uploads.");
+    Ok(UploadImagesResponse {
+        results: upload_results,
+    })
+}
+
+async fn process_single_image_upload(
+    client: &Client,
+    media_api_url: &str,
+    wp_user: &str,
+    wp_pass: &str,
+    image_url: &str,
+) -> ImageUploadResult {
+    let download_response = match client.get(image_url).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let err_msg = format!("Failed to start download for {}: {}", image_url, e);
+            println!("Rust: Error - {}", err_msg);
+            return ImageUploadResult {
+                original_url: image_url.to_string(),
+                success: false,
+                error: Some(err_msg),
+                wordpress_media_id: None,
+                wordpress_media_url: None,
+            };
+        }
+    };
+
+    if !download_response.status().is_success() {
+        let err_msg = format!(
+            "Failed to download image from {}: Status {}",
+            image_url,
+            download_response.status()
+        );
+        println!("Rust: Error - {}", err_msg);
+        return ImageUploadResult {
+            original_url: image_url.to_string(),
+            success: false,
+            error: Some(err_msg),
+            wordpress_media_id: None,
+            wordpress_media_url: None,
+        };
+    }
+
+    let image_bytes = match download_response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let err_msg = format!("Failed to read image bytes from {}: {}", image_url, e);
+            println!("Rust: Error - {}", err_msg);
+            return ImageUploadResult {
+                original_url: image_url.to_string(),
+                success: false,
+                error: Some(err_msg),
+                wordpress_media_id: None,
+                wordpress_media_url: None,
+            };
+        }
+    };
+    println!(
+        "Rust: Successfully downloaded {} bytes from {}",
+        image_bytes.len(),
+        image_url
+    );
+
+    let url_path = image_url.split('?').next().unwrap_or(image_url);
+    let url_path = url_path.split('#').next().unwrap_or(url_path);
+
+    let filename = Path::new(url_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            println!(
+                "Rust: Warning - Could not extract filename from '{}', using fallback.",
+                url_path
+            );
+            format!(
+                "upload_{}.png",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            )
+        });
+
+    let mime_type = mime_guess::from_path(&filename)
+        .first_or_octet_stream()
+        .to_string();
+
+    println!(
+        "Rust: Using cleaned filename '{}' and guessed MIME type '{}' for upload.",
+        filename, mime_type
+    );
+
+    let content_disposition_value = format!("attachment; filename=\"{}\"", filename);
+
+    println!("Rust: Sending raw image data to WordPress...");
+    let upload_response = match client
+        .post(media_api_url)
+        .basic_auth(wp_user, Some(wp_pass))
+        .header(CONTENT_TYPE, mime_type)
+        .header(CONTENT_DISPOSITION, content_disposition_value)
+        .body(image_bytes)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            let err_msg = format!("Failed to send raw upload request for {}: {}", image_url, e);
+            println!("Rust: Error - {}", err_msg);
+            return ImageUploadResult {
+                original_url: image_url.to_string(),
+                success: false,
+                error: Some(err_msg),
+                wordpress_media_id: None,
+                wordpress_media_url: None,
+            };
+        }
+    };
+
+    let status = upload_response.status();
+    println!(
+        "Rust: Received upload response from WP for {} (Status: {})",
+        image_url, status
+    );
+
+    if status.is_success() || status.as_u16() == 201 {
+        match upload_response.json::<WordPressMediaResponse>().await {
+            Ok(wp_media) => {
+                println!(
+                    "Rust: Successfully uploaded {} to WP. Media ID: {}, URL: {}",
+                    image_url, wp_media.id, wp_media.source_url
+                );
+                ImageUploadResult {
+                    original_url: image_url.to_string(),
+                    success: true,
+                    error: None,
+                    wordpress_media_id: Some(wp_media.id),
+                    wordpress_media_url: Some(wp_media.source_url),
+                }
+            }
+            Err(e) => {
+                let err_msg = format!(
+                    "Failed to parse successful WP media response for {}: {}",
+                    image_url, e
+                );
+                println!("Rust: Error - {}", err_msg);
+                ImageUploadResult {
+                    original_url: image_url.to_string(),
+                    success: false,
+                    error: Some(err_msg),
+                    wordpress_media_id: None,
+                    wordpress_media_url: None,
+                }
+            }
+        }
+    } else {
+        let error_text = upload_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Could not read WP error body".to_string());
+        let err_msg = format!(
+            "WordPress media upload failed for {} (Status {}): {}",
+            image_url, status, error_text
+        );
+        println!("Rust: Error - {}", err_msg);
+        ImageUploadResult {
+            original_url: image_url.to_string(),
+            success: false,
+            error: Some(err_msg),
+            wordpress_media_id: None,
+            wordpress_media_url: None,
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -983,7 +1233,8 @@ pub fn run() {
             generate_full_article,
             suggest_image_prompts,
             publish_to_wordpress,
-            get_wordpress_categories
+            get_wordpress_categories,
+            upload_images_to_wordpress
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

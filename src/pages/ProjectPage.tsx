@@ -95,6 +95,20 @@ const getNewSectionId = () => nextSectionId++;
 const DEFAULT_TEXT_MODEL: TextModel = "gpt-4o";
 const DEFAULT_WORD_COUNT = 1000;
 
+// --- NEW Interface matching Rust's ImageUploadResult ---
+interface ImageUploadResult {
+    original_url: string;
+    success: boolean;
+    error?: string;
+    wordpress_media_id?: number;
+    wordpress_media_url?: string;
+}
+
+// --- NEW Interface matching Rust's UploadImagesResponse ---
+interface UploadImagesResponse {
+    results: ImageUploadResult[];
+}
+
 function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: ProjectPageProps) {
   // --- State ---
   const [currentSettings, setCurrentSettings] = useState<ProjectSettings | null>(null);
@@ -134,8 +148,13 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   const [isLoadingWpCategories, setIsLoadingWpCategories] = useState(false);
   const [selectedWpCategoryId, setSelectedWpCategoryId] = useState<string>(''); // Store ID as string for select value
 
+  // --- NEW State for Image Selection and Upload ---
+  const [selectedImageIndices, setSelectedImageIndices] = useState<Set<number>>(new Set());
+  const [isUploadingImages, setIsUploadingImages] = useState(false);
+
   // --- ADD LOGGING INSIDE RENDER ---
   console.log("[ProjectPage Render] generatedArticle state:", generatedArticle ? generatedArticle.substring(0, 100) + "..." : generatedArticle);
+  console.log("[ProjectPage Render] selectedImageIndices:", selectedImageIndices);
   // --- END LOGGING ---
 
   const fetchWpCategories = useCallback(async () => {
@@ -181,6 +200,8 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         setImageGenResults({});
         setIsGeneratingImage({});
         setPromptAspectRatios({}); // Reset aspect ratios
+        setSelectedImageIndices(new Set()); // Reset selected images
+        setIsUploadingImages(false); // Reset upload state
         setTestImageAspectRatio("16x9"); // Reset test aspect ratio
         setWpCategories([]); // Clear categories on project load
         setSelectedWpCategoryId('');
@@ -463,6 +484,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
     setImageGenResults({});
     setIsGeneratingImage({});
     setPromptAspectRatios({}); // Reset aspect ratios
+    setSelectedImageIndices(new Set()); // Clear selection when suggesting new prompts
     displayFeedback("Suggesting image prompts...", "warning");
 
     try {
@@ -524,6 +546,11 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
 
       setIsGeneratingImage(prev => ({ ...prev, [index]: true })); // Set loading for this specific image
       setImageGenResults(prev => ({ ...prev, [index]: { image_url: null, error: null } })); // Clear previous result
+      setSelectedImageIndices(prev => { // Deselect image if regenerating
+          const newSet = new Set(prev);
+          newSet.delete(index);
+          return newSet;
+      });
       displayFeedback(`Requesting image ${index + 1} (${aspectRatioToUse}) for: "${promptToUse.substring(0, 30)}..."`, "success");
 
       try {
@@ -644,6 +671,80 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
        }
   };
 
+  // --- NEW Image Selection Handler ---
+  const handleImageSelectionChange = (index: number) => {
+      setSelectedImageIndices(prev => {
+          const newSet = new Set(prev);
+          if (newSet.has(index)) {
+              newSet.delete(index);
+          } else {
+              // Only allow selecting if the image exists and was generated successfully
+              if (imageGenResults[index]?.image_url) {
+                 newSet.add(index);
+              }
+          }
+          return newSet;
+      });
+  };
+
+  // --- NEW Upload Selected Images Handler ---
+  const handleUploadSelectedImages = async () => {
+      if (selectedImageIndices.size === 0) {
+          displayFeedback("No images selected for upload.", "warning");
+          return;
+      }
+      if (!currentSettings || !currentSettings.wordpress_url || !currentSettings.wordpress_user || !currentSettings.wordpress_pass) {
+          displayFeedback("WordPress URL, User, and Application Password must be configured in Base Settings.", "error");
+          return;
+      }
+
+      const urlsToUpload = Array.from(selectedImageIndices)
+          .map(index => imageGenResults[index]?.image_url)
+          .filter((url): url is string => !!url); // Filter out any undefined/null URLs
+
+      if (urlsToUpload.length === 0) {
+          displayFeedback("Selected images do not have valid URLs.", "error");
+          return;
+      }
+
+      setIsUploadingImages(true);
+      displayFeedback(`Uploading ${urlsToUpload.length} selected image(s) to WordPress...`, "warning");
+
+      try {
+          const requestPayload = {
+              project_name: projectName,
+              image_urls: urlsToUpload
+          };
+          console.log("Sending image upload payload:", requestPayload);
+
+          const response = await invoke<UploadImagesResponse>("upload_images_to_wordpress", { request: requestPayload });
+
+          console.log("Image upload response:", response);
+
+          const successCount = response.results.filter(r => r.success).length;
+          const failureCount = response.results.length - successCount;
+
+          let feedbackMessage = `Image upload complete. Success: ${successCount}, Failed: ${failureCount}.`;
+          if (failureCount > 0) {
+              response.results.filter(r => !r.success).forEach(failed => {
+                  console.error(`Upload failed for ${failed.original_url}: ${failed.error}`);
+                  feedbackMessage += `\nFailed URL: ${failed.original_url.substring(0, 50)}... Error: ${failed.error?.substring(0, 100)}`;
+              });
+          }
+          displayFeedback(feedbackMessage, failureCount > 0 ? "warning" : "success");
+
+          // Optionally, clear selection after successful upload or handle results further
+          // setSelectedImageIndices(new Set());
+
+      } catch (err) {
+          console.error("Failed to upload images:", err);
+          const errorMsg = err instanceof Error ? err.message : String(err);
+          displayFeedback(`Error uploading images: ${errorMsg}`, "error");
+      } finally {
+          setIsUploadingImages(false);
+      }
+  };
+
   // --- Update useEffect to re-fetch categories if WP settings change in the currentSettings state ---
    useEffect(() => {
      // Fetch categories whenever the relevant settings change
@@ -655,6 +756,8 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         setSelectedWpCategoryId('');
      }
    }, [currentSettings?.wordpress_url, currentSettings?.wordpress_user, currentSettings?.wordpress_pass, isLoadingSettings, fetchWpCategories]);
+
+  const hasWpCredentials = !!(currentSettings?.wordpress_url && currentSettings?.wordpress_user && currentSettings?.wordpress_pass);
 
   return (
     <div className="page-container">
@@ -829,25 +932,36 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                      </div>
 
                      {/* Button Group for Generated Article */}
-                     <div style={{ marginTop: '5px', display: 'flex', gap: '10px' }}>
+                     <div style={{ marginTop: '5px', display: 'flex', flexWrap: 'wrap', gap: '10px' }}> {/* Added flexWrap */}
                          {/* Suggest Prompts Button */}
                          <button
                             type="button"
                             onClick={handleSuggestImagePrompts}
-                            disabled={isGenerating || isSuggestingPrompts || isPublishing || !generatedArticle}
-                        >
+                            disabled={isGenerating || isSuggestingPrompts || isPublishing || isUploadingImages || !generatedArticle}
+                         >
                             {isSuggestingPrompts ? 'Suggesting...' : 'Suggest Image Prompts'}
-                        </button>
+                         </button>
 
                          {/* Publish Button */}
                          <button
                             type="button"
                             onClick={handlePublishToWordPress}
-                            disabled={isGenerating || isSuggestingPrompts || isPublishing || isLoadingWpCategories || !generatedArticle || !currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass}
-                            title={(!currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass) ? "Configure WP settings first" : "Publish to WordPress"}
-                        >
-                            {isPublishing ? 'Publishing...' : 'Publish to WordPress'}
-                        </button>
+                            disabled={isGenerating || isSuggestingPrompts || isPublishing || isUploadingImages || isLoadingWpCategories || !generatedArticle || !hasWpCredentials}
+                            title={!hasWpCredentials ? "Configure WP settings first" : "Publish to WordPress"}
+                         >
+                            {isPublishing ? 'Publishing...' : 'Publish Article'}
+                         </button>
+
+                          {/* --- NEW Upload Images Button --- */}
+                         <button
+                             type="button"
+                             onClick={handleUploadSelectedImages}
+                             disabled={isGenerating || isSuggestingPrompts || isPublishing || isUploadingImages || selectedImageIndices.size === 0 || !hasWpCredentials}
+                             title={!hasWpCredentials ? "Configure WP settings first" : selectedImageIndices.size === 0 ? "Select generated images below first" : "Upload selected images to WordPress Media Library"}
+                             style={{ marginLeft: 'auto' }} // Push to the right if space allows
+                         >
+                             {isUploadingImages ? 'Uploading...' : `Upload Selected (${selectedImageIndices.size})`}
+                         </button>
                      </div>
                  </div>
         </div>
@@ -857,7 +971,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
             <div className="card">
                 <h2>Image Prompt Suggestions</h2>
                 {suggestedPrompts.map((_, index) => (
-                    // --- Wrap each prompt section for better styling/separation ---
                     <div key={`prompt-${index}`} className="image-prompt-section" style={{ marginBottom: '25px', paddingBottom: '25px', borderBottom: '1px solid #eee' }}>
                         <label htmlFor={`prompt-input-${index}`} style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold' }}>Prompt {index + 1}:</label>
                         {/* Textarea for the prompt */}
@@ -904,7 +1017,18 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                                  {imageGenResults[index].error && <p style={{ color: 'red' }}>Error: {imageGenResults[index].error}</p>}
                                  {imageGenResults[index].image_url && (
                                      <div>
-                                        <p style={{ marginBottom: '5px', fontWeight: '500' }}>Generated Image:</p>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '5px' }}>
+                                            {/* --- NEW Checkbox for Selection --- */}
+                                            <input
+                                                type="checkbox"
+                                                id={`select-image-${index}`}
+                                                checked={selectedImageIndices.has(index)}
+                                                onChange={() => handleImageSelectionChange(index)}
+                                                disabled={isUploadingImages || isGenerating || isSuggestingPrompts || isPublishing}
+                                                style={{ transform: 'scale(1.2)' }} // Make checkbox slightly larger
+                                            />
+                                            <label htmlFor={`select-image-${index}`} style={{ fontWeight: '500', cursor: 'pointer' }}>Select this Image</label>
+                                        </div>
                                          <img
                                             src={imageGenResults[index].image_url!}
                                             alt={`Generated image for prompt ${index + 1}`}
@@ -940,8 +1064,8 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                     </div>
                     {/* Action Buttons */}
                     <div className="row" style={{ justifyContent: 'space-between', marginTop: '20px' }}>
-                         <button type="button" onClick={handleDeleteClick} className="delete-button" disabled={isGenerating || isTestingImage}>Delete Project</button>
-                         <button type="submit" disabled={isGenerating || isTestingImage}>Save Base Settings</button>
+                         <button type="button" onClick={handleDeleteClick} className="delete-button" disabled={isGenerating || isTestingImage || isUploadingImages}>Delete Project</button>
+                         <button type="submit" disabled={isGenerating || isTestingImage || isUploadingImages}>Save Base Settings</button>
                     </div>
                 </form>
             )}
