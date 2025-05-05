@@ -1,11 +1,12 @@
 use mime_guess;
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_TYPE};
-use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_TYPE, RETRY_AFTER};
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tauri::Manager;
 use tauri_plugin_store::{JsonValue, StoreExt};
 use tokio::time::sleep;
@@ -192,7 +193,7 @@ struct UploadImageRequest {
     image_urls: Vec<String>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 struct ImageUploadResult {
     original_url: String,
     success: bool,
@@ -210,6 +211,25 @@ struct UploadImagesResponse {
 struct WordPressMediaResponse {
     id: u32,
     source_url: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ImageDetailsForLLM {
+    wordpress_media_url: String,
+    wordpress_media_id: u32,
+    alt_text: String,
+    placeholder_index: usize,
+}
+
+#[derive(Deserialize, Debug)]
+struct InsertPlaceholdersLLMRequest {
+    article_html: String,
+    images: Vec<ImageDetailsForLLM>,
+}
+
+#[derive(Serialize, Debug)]
+struct InsertPlaceholdersLLMResponse {
+    article_with_placeholders: String,
 }
 
 #[tauri::command]
@@ -993,14 +1013,14 @@ async fn upload_images_to_wordpress(
     let client = Client::new();
     let mut upload_results: Vec<ImageUploadResult> = Vec::new();
 
-    for image_url in request.image_urls {
-        println!("Rust: Processing image URL: {}", image_url);
+    for (index, image_url) in request.image_urls.iter().enumerate() {
+        println!("Rust: Processing image URL {}: {}", index + 1, image_url);
         let result = process_single_image_upload(
             &client,
             &media_api_url,
             &settings.wordpress_user,
             &settings.wordpress_pass,
-            &image_url,
+            image_url,
         )
         .await;
         upload_results.push(result);
@@ -1019,6 +1039,9 @@ async fn process_single_image_upload(
     wp_pass: &str,
     image_url: &str,
 ) -> ImageUploadResult {
+    const MAX_RETRIES: u32 = 4;
+    const INITIAL_BACKOFF_SECS: u64 = 10;
+
     let download_response = match client.get(image_url).send().await {
         Ok(resp) => resp,
         Err(e) => {
@@ -1104,82 +1127,276 @@ async fn process_single_image_upload(
     let content_disposition_value = format!("attachment; filename=\"{}\"", filename);
 
     println!("Rust: Sending raw image data to WordPress...");
-    let upload_response = match client
-        .post(media_api_url)
-        .basic_auth(wp_user, Some(wp_pass))
-        .header(CONTENT_TYPE, mime_type)
-        .header(CONTENT_DISPOSITION, content_disposition_value)
-        .body(image_bytes)
-        .send()
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            let err_msg = format!("Failed to send raw upload request for {}: {}", image_url, e);
-            println!("Rust: Error - {}", err_msg);
-            return ImageUploadResult {
-                original_url: image_url.to_string(),
-                success: false,
-                error: Some(err_msg),
-                wordpress_media_id: None,
-                wordpress_media_url: None,
-            };
-        }
-    };
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        println!("Rust: Upload attempt {} for {}", attempts, image_url);
 
-    let status = upload_response.status();
-    println!(
-        "Rust: Received upload response from WP for {} (Status: {})",
-        image_url, status
-    );
-
-    if status.is_success() || status.as_u16() == 201 {
-        match upload_response.json::<WordPressMediaResponse>().await {
-            Ok(wp_media) => {
-                println!(
-                    "Rust: Successfully uploaded {} to WP. Media ID: {}, URL: {}",
-                    image_url, wp_media.id, wp_media.source_url
-                );
-                ImageUploadResult {
-                    original_url: image_url.to_string(),
-                    success: true,
-                    error: None,
-                    wordpress_media_id: Some(wp_media.id),
-                    wordpress_media_url: Some(wp_media.source_url),
-                }
-            }
+        let current_image_bytes = image_bytes.clone();
+        let upload_response = match client
+            .post(media_api_url)
+            .basic_auth(wp_user, Some(wp_pass))
+            .header(CONTENT_TYPE, &mime_type)
+            .header(CONTENT_DISPOSITION, &content_disposition_value)
+            .body(current_image_bytes)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
             Err(e) => {
                 let err_msg = format!(
-                    "Failed to parse successful WP media response for {}: {}",
-                    image_url, e
+                    "Failed to send upload request (Attempt {}): {}",
+                    attempts, e
                 );
                 println!("Rust: Error - {}", err_msg);
-                ImageUploadResult {
+                return ImageUploadResult {
                     original_url: image_url.to_string(),
                     success: false,
                     error: Some(err_msg),
                     wordpress_media_id: None,
                     wordpress_media_url: None,
+                };
+            }
+        };
+
+        let status = upload_response.status();
+        println!(
+            "Rust: Received upload response (Attempt {}) - Status: {}",
+            attempts, status
+        );
+
+        match status {
+            StatusCode::OK | StatusCode::CREATED => {
+                match upload_response.json::<WordPressMediaResponse>().await {
+                    Ok(wp_media) => {
+                        println!(
+                            "Rust: Success (Attempt {}) - WP Media ID: {}, URL: {}",
+                            attempts, wp_media.id, wp_media.source_url
+                        );
+                        return ImageUploadResult {
+                            original_url: image_url.to_string(),
+                            success: true,
+                            error: None,
+                            wordpress_media_id: Some(wp_media.id),
+                            wordpress_media_url: Some(wp_media.source_url),
+                        };
+                    }
+                    Err(e) => {
+                        let err_msg = format!(
+                            "Failed to parse successful WP media response (Attempt {}): {}",
+                            attempts, e
+                        );
+                        println!("Rust: Error - {}", err_msg);
+                        return ImageUploadResult {
+                            original_url: image_url.to_string(),
+                            success: false,
+                            error: Some(err_msg),
+                            wordpress_media_id: None,
+                            wordpress_media_url: None,
+                        };
+                    }
                 }
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                if attempts >= MAX_RETRIES {
+                    let err_msg = format!(
+                        "Upload failed after {} attempts due to rate limiting (429).",
+                        attempts
+                    );
+                    println!("Rust: Error - {}", err_msg);
+                    let body_text = upload_response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "Could not read 429 error body".to_string());
+                    println!("Rust: Last 429 Body: {}", body_text);
+                    return ImageUploadResult {
+                        original_url: image_url.to_string(),
+                        success: false,
+                        error: Some(err_msg),
+                        wordpress_media_id: None,
+                        wordpress_media_url: None,
+                    };
+                }
+
+                let wait_duration = match upload_response.headers().get(RETRY_AFTER) {
+                    Some(retry_header) => {
+                        if let Ok(seconds_str) = retry_header.to_str() {
+                            if let Ok(seconds) = seconds_str.parse::<u64>() {
+                                println!(
+                                    "Rust: Rate limited (429). Obeying Retry-After: {} seconds.",
+                                    seconds
+                                );
+                                Duration::from_secs(seconds.max(1))
+                            } else {
+                                let backoff_secs = INITIAL_BACKOFF_SECS * 2u64.pow(attempts - 1);
+                                println!("Rust: Rate limited (429). Couldn't parse Retry-After header '{}'. Using exponential backoff: {} seconds.", seconds_str, backoff_secs);
+                                Duration::from_secs(backoff_secs)
+                            }
+                        } else {
+                            let backoff_secs = INITIAL_BACKOFF_SECS * 2u64.pow(attempts - 1);
+                            println!("Rust: Rate limited (429). Invalid Retry-After header value. Using exponential backoff: {} seconds.", backoff_secs);
+                            Duration::from_secs(backoff_secs)
+                        }
+                    }
+                    None => {
+                        let backoff_secs = INITIAL_BACKOFF_SECS * 2u64.pow(attempts - 1);
+                        println!("Rust: Rate limited (429). No Retry-After header. Using exponential backoff: {} seconds.", backoff_secs);
+                        Duration::from_secs(backoff_secs)
+                    }
+                };
+
+                println!("Rust: Waiting for {:?} before retry...", wait_duration);
+                sleep(wait_duration).await;
+            }
+            _ => {
+                let error_text = upload_response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Could not read error body".to_string());
+                let err_msg = format!(
+                    "WordPress media upload failed (Attempt {}) with status {}: {}",
+                    attempts, status, error_text
+                );
+                println!("Rust: Error - {}", err_msg);
+                return ImageUploadResult {
+                    original_url: image_url.to_string(),
+                    success: false,
+                    error: Some(err_msg),
+                    wordpress_media_id: None,
+                    wordpress_media_url: None,
+                };
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn get_article_with_image_placeholders_llm(
+    app: tauri::AppHandle,
+    request: InsertPlaceholdersLLMRequest,
+) -> Result<InsertPlaceholdersLLMResponse, String> {
+    println!(
+        "Rust: Received request to get article with {} image placeholders via LLM.",
+        request.images.len()
+    );
+
+    if request.images.is_empty() {
+        println!("Rust: No images provided, returning original HTML.");
+        return Ok(InsertPlaceholdersLLMResponse {
+            article_with_placeholders: request.article_html,
+        });
+    }
+
+    let api_key = get_api_key(app.clone(), STORE_KEY_TEXT_API.to_string())
+        .await?
+        .ok_or_else(|| "OpenAI API Key (textApiKey) not found in store.".to_string())?;
+
+    let image_list_string = request
+        .images
+        .iter()
+        .map(|img| {
+            format!(
+                "Image Placeholder: [INSERT_IMAGE_HERE_{}]\n   Context/Alt Text: {}\n   (URL: {}, WP ID: {})",
+                img.placeholder_index,
+                img.alt_text,
+                img.wordpress_media_url,
+                img.wordpress_media_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let system_prompt = "You are an AI assistant that modifies HTML articles. Your task is to insert unique image placeholders (like [INSERT_IMAGE_HERE_1], [INSERT_IMAGE_HERE_2], etc.) into the provided HTML article at semantically relevant locations based on the image's context/alt text and the surrounding article content. Ensure the final output is ONLY the complete, valid HTML code for the modified article including the placeholders, starting with <!DOCTYPE html> or <html> and ending with </html>. Do not include any explanations or preamble.";
+
+    let user_prompt = format!(
+        r#"Please modify the following HTML article by inserting the unique placeholders provided for each image.
+
+Placeholders and Context:
+---
+{}
+---
+
+HTML Article to Modify:
+---
+{}
+---
+
+Instructions:
+1. Analyze the article content and the context/alt text for each image placeholder.
+2. For each image placeholder (e.g., `[INSERT_IMAGE_HERE_1]`), insert it exactly as provided into the most semantically relevant location within the article body.
+3. Place placeholders where they enhance the content, ideally near paragraphs discussing related topics. Avoid breaking HTML structure. Do not place placeholders inside header tags (h1, h2, etc.) or within other HTML tags. Place them between paragraphs or block elements where an image would naturally fit.
+4. Ensure ALL provided placeholders are inserted exactly once.
+5. Return ONLY the complete, modified HTML article content including the inserted placeholders. Do not add any introductory text, explanations, or code fences.
+
+Modified HTML Article with Placeholders:"#,
+        image_list_string, request.article_html
+    );
+
+    println!("Rust: Sending request to LLM for image placeholder insertion.");
+    let model = "gpt-4o";
+
+    let client = reqwest::Client::new();
+    let api_url = "https://api.openai.com/v1/chat/completions";
+
+    let request_body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
+        ],
+        "temperature": 0.5
+    });
+
+    let response = client
+        .post(api_url)
+        .bearer_auth(&api_key)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to OpenAI: {}", e))?;
+
+    let status = response.status();
+    let response_body_text = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read OpenAI response body: {}", e))?;
+
+    println!(
+        "Rust: Received LLM placeholder insertion response (Status: {})",
+        status
+    );
+
+    if status.is_success() {
+        match serde_json::from_str::<OpenAiApiResponse>(&response_body_text) {
+            Ok(parsed_response) => {
+                if let Some(choice) = parsed_response.choices.get(0) {
+                    println!("Rust: Successfully extracted HTML with placeholders from LLM.");
+                    Ok(InsertPlaceholdersLLMResponse {
+                        article_with_placeholders: choice.message.content.trim().to_string(),
+                    })
+                } else {
+                    Err("OpenAI response successful but 'choices' array was empty.".to_string())
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Rust: Error parsing LLM response JSON: {}. Using raw response.",
+                    e
+                );
+                Ok(InsertPlaceholdersLLMResponse {
+                    article_with_placeholders: response_body_text.trim().to_string(),
+                })
             }
         }
     } else {
-        let error_text = upload_response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Could not read WP error body".to_string());
-        let err_msg = format!(
-            "WordPress media upload failed for {} (Status {}): {}",
-            image_url, status, error_text
+        eprintln!(
+            "Rust: LLM placeholder insertion request failed - Status: {}, Body:\n{}",
+            status, response_body_text
         );
-        println!("Rust: Error - {}", err_msg);
-        ImageUploadResult {
-            original_url: image_url.to_string(),
-            success: false,
-            error: Some(err_msg),
-            wordpress_media_id: None,
-            wordpress_media_url: None,
-        }
+        Err(format!(
+            "OpenAI API request failed with status {}: {}",
+            status, response_body_text
+        ))
     }
 }
 
@@ -1234,7 +1451,8 @@ pub fn run() {
             suggest_image_prompts,
             publish_to_wordpress,
             get_wordpress_categories,
-            upload_images_to_wordpress
+            upload_images_to_wordpress,
+            get_article_with_image_placeholders_llm
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

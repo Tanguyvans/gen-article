@@ -109,6 +109,21 @@ interface UploadImagesResponse {
     results: ImageUploadResult[];
 }
 
+// --- NEW Interfaces for LLM Placeholder Insertion ---
+interface ImageDetailsForLLM {
+    wordpress_media_url: string;
+    wordpress_media_id: number;
+    alt_text: string;
+    placeholder_index: number;
+}
+interface InsertPlaceholdersLLMRequest {
+    article_html: string;
+    images: ImageDetailsForLLM[];
+}
+interface InsertPlaceholdersLLMResponse {
+    article_with_placeholders: string;
+}
+
 function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: ProjectPageProps) {
   // --- State ---
   const [currentSettings, setCurrentSettings] = useState<ProjectSettings | null>(null);
@@ -151,10 +166,12 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   // --- NEW State for Image Selection and Upload ---
   const [selectedImageIndices, setSelectedImageIndices] = useState<Set<number>>(new Set());
   const [isUploadingImages, setIsUploadingImages] = useState(false);
+  const [isInsertingPlaceholders, setIsInsertingPlaceholders] = useState(false);
 
   // --- ADD LOGGING INSIDE RENDER ---
   console.log("[ProjectPage Render] generatedArticle state:", generatedArticle ? generatedArticle.substring(0, 100) + "..." : generatedArticle);
   console.log("[ProjectPage Render] selectedImageIndices:", selectedImageIndices);
+  console.log("[ProjectPage Render] isInsertingPlaceholders:", isInsertingPlaceholders);
   // --- END LOGGING ---
 
   const fetchWpCategories = useCallback(async () => {
@@ -687,8 +704,8 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
       });
   };
 
-  // --- NEW Upload Selected Images Handler ---
-  const handleUploadSelectedImages = async () => {
+  // --- Modified Upload/Insert Handler ---
+  const handleUploadAndInsertImages = async () => {
       if (selectedImageIndices.size === 0) {
           displayFeedback("No images selected for upload.", "warning");
           return;
@@ -698,50 +715,123 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
           return;
       }
 
-      const urlsToUpload = Array.from(selectedImageIndices)
-          .map(index => imageGenResults[index]?.image_url)
-          .filter((url): url is string => !!url); // Filter out any undefined/null URLs
+      const imagesToUpload: { originalIndex: number; url: string }[] = Array.from(selectedImageIndices)
+          .map(index => ({ originalIndex: index, url: imageGenResults[index]?.image_url }))
+          .filter((item): item is { originalIndex: number; url: string } => !!item.url);
 
-      if (urlsToUpload.length === 0) {
+      if (imagesToUpload.length === 0) {
           displayFeedback("Selected images do not have valid URLs.", "error");
+          // This case should be rare now due to the filter above, but good to keep
           return;
       }
 
-      setIsUploadingImages(true);
-      displayFeedback(`Uploading ${urlsToUpload.length} selected image(s) to WordPress...`, "warning");
+      setIsUploadingImages(true); // Start upload phase
+      setIsInsertingPlaceholders(false); // Ensure placeholder phase isn't active yet
+      const initialArticleContent = generatedArticle || ""; // Store initial content
+      displayFeedback(`Uploading ${imagesToUpload.length} selected image(s) to WordPress...`, "warning");
+
+      let uploadResponse: UploadImagesResponse | null = null;
+      let successfulUploads: ImageUploadResult[] = []; // Store successful uploads
 
       try {
-          const requestPayload = {
+          // --- Step 1: Upload Images ---
+          const uploadRequestPayload = {
               project_name: projectName,
-              image_urls: urlsToUpload
+              image_urls: imagesToUpload.map(item => item.url)
           };
-          console.log("Sending image upload payload:", requestPayload);
+          console.log("Sending image upload payload:", uploadRequestPayload);
+          uploadResponse = await invoke<UploadImagesResponse>("upload_images_to_wordpress", { request: uploadRequestPayload });
+          console.log("Image upload response:", uploadResponse);
 
-          const response = await invoke<UploadImagesResponse>("upload_images_to_wordpress", { request: requestPayload });
+          successfulUploads = uploadResponse.results.filter(r => r.success && r.wordpress_media_url && r.wordpress_media_id);
+          const failedUploads = uploadResponse.results.filter(r => !r.success);
+          const successCount = successfulUploads.length;
+          const failureCount = failedUploads.length;
 
-          console.log("Image upload response:", response);
+           let uploadFeedback = `Upload complete. Success: ${successCount}, Failed: ${failureCount}.`;
+           if (failureCount > 0) {
+                failedUploads.forEach(failed => console.error(`Upload failed for ${failed.original_url}: ${failed.error}`));
+                uploadFeedback += ` Check console for details on failed uploads.`;
+           }
+           displayFeedback(uploadFeedback, failureCount > 0 ? "warning" : "success");
 
-          const successCount = response.results.filter(r => r.success).length;
-          const failureCount = response.results.length - successCount;
 
-          let feedbackMessage = `Image upload complete. Success: ${successCount}, Failed: ${failureCount}.`;
-          if (failureCount > 0) {
-              response.results.filter(r => !r.success).forEach(failed => {
-                  console.error(`Upload failed for ${failed.original_url}: ${failed.error}`);
-                  feedbackMessage += `\nFailed URL: ${failed.original_url.substring(0, 50)}... Error: ${failed.error?.substring(0, 100)}`;
-              });
+          // --- Step 2: Get Article with Placeholders via LLM (if any uploads succeeded) ---
+          if (successCount > 0 && generatedArticle) {
+                setIsUploadingImages(false); // End upload phase display
+                setIsInsertingPlaceholders(true); // Start placeholder insertion phase display
+                displayFeedback(`Asking LLM to suggest placement for ${successCount} image(s)...`, "warning");
+
+                 // Map successful uploads to the details needed by the LLM/backend
+                const imagesForLLM: ImageDetailsForLLM[] = successfulUploads.map((result, idx) => {
+                     const uploadedItem = imagesToUpload.find(item => item.url === result.original_url);
+                     const originalIndex = uploadedItem ? uploadedItem.originalIndex : -1;
+                     const altText = originalIndex !== -1 ? (editedPrompts[originalIndex] || `Image ${originalIndex + 1} for ${projectName}`) : `Uploaded image for ${projectName}`;
+
+                    return {
+                        wordpress_media_url: result.wordpress_media_url!,
+                        wordpress_media_id: result.wordpress_media_id!,
+                        alt_text: altText.replace(/"/g, '&quot;'),
+                        placeholder_index: idx + 1 // Assign sequential index (1, 2, 3...) for placeholders
+                    };
+                });
+
+
+                const placeholderRequest: InsertPlaceholdersLLMRequest = {
+                    article_html: generatedArticle, // Send current article content
+                    images: imagesForLLM
+                };
+
+                console.log("Sending request for article with placeholders:", placeholderRequest);
+                const placeholderResponse = await invoke<InsertPlaceholdersLLMResponse>("get_article_with_image_placeholders_llm", { request: placeholderRequest });
+                console.log("LLM placeholder insertion response received.");
+
+                // --- Step 3: Replace Placeholders with Actual Images ---
+                let finalArticleContent = placeholderResponse.article_with_placeholders;
+                let replacementsMade = 0;
+                imagesForLLM.forEach((imgDetails) => {
+                     const placeholder = `[INSERT_IMAGE_HERE_${imgDetails.placeholder_index}]`;
+                     // Simple non-regex replaceAll (more robust if placeholder chars aren't special)
+                     const placeholderRegex = new RegExp(`\\[INSERT_IMAGE_HERE_${imgDetails.placeholder_index}\\]`, 'g');
+                     const imgTag = `<img src="${imgDetails.wordpress_media_url}" alt="${imgDetails.alt_text}" class="wp-image-${imgDetails.wordpress_media_id} aligncenter size-large" />`; // Adjust classes as needed
+
+                     if (finalArticleContent.includes(placeholder)) {
+                          finalArticleContent = finalArticleContent.replace(placeholderRegex, imgTag);
+                          console.log(`Replaced placeholder ${placeholder} with image tag.`);
+                          replacementsMade++;
+                     } else {
+                          console.warn(`Placeholder ${placeholder} not found in LLM response.`);
+                     }
+                });
+
+                setGeneratedArticle(finalArticleContent); // Update article state with final result
+                displayFeedback(`Image placement complete. ${replacementsMade}/${successCount} images inserted. (Failed Uploads: ${failureCount})`, replacementsMade < successCount ? "warning" : "success");
+
+
+          } else if (successCount === 0) {
+               // Handled by initial feedback after upload
+          } else { // uploads succeeded but no article text exists
+               displayFeedback(`Images uploaded (${successCount}), but no article content exists to insert them into.`, "warning");
           }
-          displayFeedback(feedbackMessage, failureCount > 0 ? "warning" : "success");
 
-          // Optionally, clear selection after successful upload or handle results further
+          // Optionally clear selection?
           // setSelectedImageIndices(new Set());
 
       } catch (err) {
-          console.error("Failed to upload images:", err);
+          // Handle errors from upload or placeholder steps
+          console.error("Error during image upload or placeholder insertion:", err);
           const errorMsg = err instanceof Error ? err.message : String(err);
-          displayFeedback(`Error uploading images: ${errorMsg}`, "error");
+           if (isUploadingImages) {
+               displayFeedback(`Error during image upload: ${errorMsg}`, "error");
+           } else if (isInsertingPlaceholders) {
+               displayFeedback(`Error during placeholder insertion: ${errorMsg}`, "error");
+           } else {
+                displayFeedback(`An unexpected error occurred: ${errorMsg}`, "error");
+           }
+
       } finally {
-          setIsUploadingImages(false);
+          setIsUploadingImages(false); // Ensure both flags are cleared
+          setIsInsertingPlaceholders(false);
       }
   };
 
@@ -758,12 +848,13 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
    }, [currentSettings?.wordpress_url, currentSettings?.wordpress_user, currentSettings?.wordpress_pass, isLoadingSettings, fetchWpCategories]);
 
   const hasWpCredentials = !!(currentSettings?.wordpress_url && currentSettings?.wordpress_user && currentSettings?.wordpress_pass);
+  const anyLoading = isGenerating || isSuggestingPrompts || isPublishing || isUploadingImages || isInsertingPlaceholders || isLoadingSettings || isLoadingWpCategories || isTestingImage;
 
   return (
     <div className="page-container">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '25px' }}>
             <h1>Project: {projectName}</h1>
-             <button onClick={onBack} disabled={isGenerating || isTestingImage}>&larr; Back to Projects</button>
+             <button onClick={onBack} disabled={anyLoading}>&larr; Back to Projects</button>
         </div>
 
         {/* --- Article Configuration Card --- */}
@@ -776,7 +867,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                     <input
                        id="toolName" type="text" value={toolNameInput}
                        onChange={(e) => setToolNameInput(e.target.value)}
-                       placeholder="Enter the name of the AI tool" required disabled={isGenerating || isLoadingSettings}
+                       placeholder="Enter the name of the AI tool" required disabled={anyLoading}
                      />
                 </div>
 
@@ -790,7 +881,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                        onChange={(e) => setArticleGoalPromptInput(e.target.value)}
                        rows={4}
                        placeholder="Describe the main goal and focus for articles generated in this project..."
-                       disabled={isGenerating || isLoadingSettings}
+                       disabled={anyLoading}
                        style={{ flexGrow: 1 }}/>
                 </div>
 
@@ -804,7 +895,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                         value={exampleUrlInput}
                         onChange={(e) => setExampleUrlInput(e.target.value)}
                         placeholder="https://www.example-review.com/some-article"
-                        disabled={isGenerating || isLoadingSettings} />
+                        disabled={anyLoading} />
                 </div>
 
                 {/* --- NEW Model Selection --- */}
@@ -814,7 +905,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                         id="textModel"
                         value={textModelInput}
                         onChange={(e) => setTextModelInput(e.target.value as TextModel)}
-                        disabled={isGenerating || isLoadingSettings}
+                        disabled={anyLoading}
                     >
                         {textGenerationModels.map(model => (
                             <option key={model} value={model}>{model}</option>
@@ -833,7 +924,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                         min="50" // Set a minimum
                         step="50"
                         placeholder="e.g., 1000"
-                        disabled={isGenerating || isLoadingSettings}
+                        disabled={anyLoading}
                         style={{ width: '100px' }} // Adjust width if needed
                     />
                 </div>
@@ -847,9 +938,9 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
                              <h4>Section {index + 1}</h4>
                              <div className="section-controls" style={{ display: 'flex', gap: '5px' }}>
-                                 <button type="button" onClick={() => handleMoveSection(section.id, 'up')} disabled={index === 0 || isGenerating} title="Move Up" style={{ padding: '0.3em 0.6em'}}>&#8593;</button>
-                                 <button type="button" onClick={() => handleMoveSection(section.id, 'down')} disabled={index === sectionDefinitions.length - 1 || isGenerating} title="Move Down" style={{ padding: '0.3em 0.6em'}}>&#8595;</button>
-                                 <button type="button" onClick={() => handleRemoveSection(section.id)} disabled={isGenerating} title="Remove Section" style={{ padding: '0.3em 0.6em', color: 'red' }}>&times;</button>
+                                 <button type="button" onClick={() => handleMoveSection(section.id, 'up')} disabled={index === 0 || anyLoading} title="Move Up" style={{ padding: '0.3em 0.6em'}}>&#8593;</button>
+                                 <button type="button" onClick={() => handleMoveSection(section.id, 'down')} disabled={index === sectionDefinitions.length - 1 || anyLoading} title="Move Down" style={{ padding: '0.3em 0.6em'}}>&#8595;</button>
+                                 <button type="button" onClick={() => handleRemoveSection(section.id)} disabled={anyLoading} title="Remove Section" style={{ padding: '0.3em 0.6em', color: 'red' }}>&times;</button>
                              </div>
                          </div>
                          <div className="row" style={{ alignItems: 'flex-start' }}>
@@ -861,7 +952,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                                 rows={5}
                                 placeholder={`Enter detailed prompt/instructions for section ${index + 1}...`}
                                 required
-                                disabled={isGenerating}
+                                disabled={anyLoading}
                              />
                          </div>
                      </div>
@@ -870,7 +961,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                 {/* Buttons specific to Article Configuration */}
                 <div style={{ marginTop: '15px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
                     {!isLoadingSettings && (
-                         <button type="button" onClick={handleAddSection} disabled={isGenerating} >
+                         <button type="button" onClick={handleAddSection} disabled={anyLoading} >
                              + Add Section
                          </button>
                      )}
@@ -878,7 +969,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                          <button
                             type="button"
                             onClick={handleSaveArticleConfig}
-                            disabled={isGenerating || isLoadingSettings || !toolNameInput.trim() || !articleGoalPromptInput.trim()}
+                            disabled={anyLoading || !toolNameInput.trim() || !articleGoalPromptInput.trim()}
                          >
                              Save Article Config
                          </button>
@@ -889,9 +980,9 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                  <button
                      type="button"
                      onClick={() => handleGenerateFullArticle()}
-                     disabled={isGenerating || isLoadingSettings || sectionDefinitions.length === 0 || !toolNameInput.trim() || !articleGoalPromptInput.trim() || !wordCountInput || parseInt(wordCountInput) <=0 }
+                     disabled={anyLoading || sectionDefinitions.length === 0 || !toolNameInput.trim() || !articleGoalPromptInput.trim() || !wordCountInput || parseInt(wordCountInput) <=0 }
                      style={{ marginTop: '20px', display: 'block', width: '100%' }}>
-                     {isGenerating ? "Generating..." : "Generate Full Article"}
+                     {anyLoading ? "Generating..." : "Generate Full Article"}
                  </button>
              </div>
               {/* Display Generated Article Area */}
@@ -911,7 +1002,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                             id="wpCategory"
                             value={selectedWpCategoryId}
                             onChange={(e) => setSelectedWpCategoryId(e.target.value)}
-                            disabled={isLoadingWpCategories || isPublishing || wpCategories.length === 0}
+                            disabled={anyLoading || isPublishing || wpCategories.length === 0}
                             style={{ flexGrow: 1 }}
                         >
                             <option value="">-- Select Category (Optional) --</option>
@@ -923,7 +1014,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                         <button
                             type="button"
                             onClick={fetchWpCategories}
-                            disabled={isLoadingWpCategories || isPublishing || !currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass}
+                            disabled={anyLoading || isPublishing || !currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass}
                             style={{ marginLeft: '10px', padding: '0.4em 0.8em' }}
                             title="Refresh Category List"
                         >
@@ -932,35 +1023,30 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                      </div>
 
                      {/* Button Group for Generated Article */}
-                     <div style={{ marginTop: '5px', display: 'flex', flexWrap: 'wrap', gap: '10px' }}> {/* Added flexWrap */}
-                         {/* Suggest Prompts Button */}
+                     <div style={{ marginTop: '5px', display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
                          <button
                             type="button"
                             onClick={handleSuggestImagePrompts}
-                            disabled={isGenerating || isSuggestingPrompts || isPublishing || isUploadingImages || !generatedArticle}
+                            disabled={anyLoading || isPublishing || isInsertingPlaceholders || !generatedArticle}
                          >
                             {isSuggestingPrompts ? 'Suggesting...' : 'Suggest Image Prompts'}
                          </button>
-
-                         {/* Publish Button */}
                          <button
                             type="button"
                             onClick={handlePublishToWordPress}
-                            disabled={isGenerating || isSuggestingPrompts || isPublishing || isUploadingImages || isLoadingWpCategories || !generatedArticle || !hasWpCredentials}
+                            disabled={anyLoading || isPublishing || isInsertingPlaceholders || isLoadingWpCategories || !generatedArticle || !hasWpCredentials}
                             title={!hasWpCredentials ? "Configure WP settings first" : "Publish to WordPress"}
                          >
                             {isPublishing ? 'Publishing...' : 'Publish Article'}
                          </button>
-
-                          {/* --- NEW Upload Images Button --- */}
                          <button
                              type="button"
-                             onClick={handleUploadSelectedImages}
-                             disabled={isGenerating || isSuggestingPrompts || isPublishing || isUploadingImages || selectedImageIndices.size === 0 || !hasWpCredentials}
-                             title={!hasWpCredentials ? "Configure WP settings first" : selectedImageIndices.size === 0 ? "Select generated images below first" : "Upload selected images to WordPress Media Library"}
-                             style={{ marginLeft: 'auto' }} // Push to the right if space allows
+                             onClick={handleUploadAndInsertImages}
+                             disabled={anyLoading || isPublishing || isInsertingPlaceholders || selectedImageIndices.size === 0 || !hasWpCredentials}
+                             title={!hasWpCredentials ? "Configure WP settings first" : selectedImageIndices.size === 0 ? "Select generated images below first" : "Upload selected images & Insert into Article"}
+                             style={{ marginLeft: 'auto' }}
                          >
-                             {isUploadingImages ? 'Uploading...' : `Upload Selected (${selectedImageIndices.size})`}
+                             {isUploadingImages ? 'Uploading...' : isInsertingPlaceholders ? 'Placing Images...' : `Upload & Place (${selectedImageIndices.size})`}
                          </button>
                      </div>
                  </div>
@@ -980,7 +1066,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                             onChange={(e) => handleEditedPromptChange(index, e.target.value)}
                             rows={3}
                             placeholder={`Edit suggested prompt ${index + 1}...`}
-                            disabled={isGeneratingImage[index] || isGenerating || isSuggestingPrompts}
+                            disabled={anyLoading}
                             style={{ width: '100%', minHeight: '60px', marginBottom: '10px', boxSizing: 'border-box' }} // Ensure full width and add margin
                         />
                         {/* --- Controls Row (Dropdown + Button) --- */}
@@ -992,7 +1078,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                                     id={`prompt-aspect-${index}`}
                                     value={promptAspectRatios[index] || "16x9"}
                                     onChange={(e) => handlePromptAspectRatioChange(index, e.target.value)}
-                                    disabled={isGeneratingImage[index] || isGenerating || isSuggestingPrompts}
+                                    disabled={anyLoading}
                                 >
                                     {ideogramAspectRatios.map(ratio => (
                                         <option key={ratio} value={ratio}>{ratio}</option>
@@ -1004,9 +1090,9 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                                 <button
                                     type="button"
                                     onClick={() => handleGenerateSpecificImage(index)}
-                                    disabled={isGeneratingImage[index] || !editedPrompts[index]?.trim()}
+                                    disabled={anyLoading || !editedPrompts[index]?.trim()}
                                 >
-                                    {isGeneratingImage[index] ? 'Generating...' : 'Generate Image'}
+                                    {anyLoading ? 'Generating...' : 'Generate Image'}
                                 </button>
                             </div>
                         </div>
@@ -1024,7 +1110,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                                                 id={`select-image-${index}`}
                                                 checked={selectedImageIndices.has(index)}
                                                 onChange={() => handleImageSelectionChange(index)}
-                                                disabled={isUploadingImages || isGenerating || isSuggestingPrompts || isPublishing}
+                                                disabled={anyLoading}
                                                 style={{ transform: 'scale(1.2)' }} // Make checkbox slightly larger
                                             />
                                             <label htmlFor={`select-image-${index}`} style={{ fontWeight: '500', cursor: 'pointer' }}>Select this Image</label>
@@ -1052,20 +1138,20 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                     {/* WP Settings */}
                     <div className="row">
                         <label htmlFor="wp-url">WordPress URL:</label>
-                        <input type="text" id="wp-url" name="wordpress_url" value={currentSettings.wordpress_url} onChange={handleWpSettingsChange} placeholder="https://your-site.com" disabled={isGenerating || isTestingImage} />
+                        <input type="text" id="wp-url" name="wordpress_url" value={currentSettings.wordpress_url} onChange={handleWpSettingsChange} placeholder="https://your-site.com" disabled={anyLoading} />
                     </div>
                     <div className="row">
                         <label htmlFor="wp-user">WordPress User:</label>
-                        <input type="text" id="wp-user" name="wordpress_user" value={currentSettings.wordpress_user} onChange={handleWpSettingsChange} disabled={isGenerating || isTestingImage}/>
+                        <input type="text" id="wp-user" name="wordpress_user" value={currentSettings.wordpress_user} onChange={handleWpSettingsChange} disabled={anyLoading}/>
                     </div>
                     <div className="row">
                         <label htmlFor="wp-pass">WordPress Pass:</label>
-                        <input type="password" id="wp-pass" name="wordpress_pass" value={currentSettings.wordpress_pass} onChange={handleWpSettingsChange} placeholder="App Password Recommended" disabled={isGenerating || isTestingImage}/>
+                        <input type="password" id="wp-pass" name="wordpress_pass" value={currentSettings.wordpress_pass} onChange={handleWpSettingsChange} placeholder="App Password Recommended" disabled={anyLoading}/>
                     </div>
                     {/* Action Buttons */}
                     <div className="row" style={{ justifyContent: 'space-between', marginTop: '20px' }}>
-                         <button type="button" onClick={handleDeleteClick} className="delete-button" disabled={isGenerating || isTestingImage || isUploadingImages}>Delete Project</button>
-                         <button type="submit" disabled={isGenerating || isTestingImage || isUploadingImages}>Save Base Settings</button>
+                         <button type="button" onClick={handleDeleteClick} className="delete-button" disabled={anyLoading}>Delete Project</button>
+                         <button type="submit" disabled={anyLoading}>Save Base Settings</button>
                     </div>
                 </form>
             )}
