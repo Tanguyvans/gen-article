@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, FormEvent, ChangeEvent } from 'react';
 import { invoke } from "@tauri-apps/api/core";
-import { DisplayFeedback, FeedbackType } from '../App'; // Import type AND FeedbackType
+import { DisplayFeedback } from '../App'; // Import type AND FeedbackType
 
 // Corresponds to Rust's SectionDefinitionData
 interface SectionDefinitionData {
@@ -18,14 +18,23 @@ interface ProjectSettings {
   wordpress_user: string;
   wordpress_pass: string;
   toolName: string;
-  article_goal_prompt: string; // Renamed from generation_prompt
-  example_url: string;         // Added example URL
+  article_goal_prompt: string;
+  example_url: string;
   sections: SectionDefinitionData[];
+  text_generation_model: string;
+  target_word_count: number;
 }
 
 // Interface for the response from the backend
 interface ArticleResponse {
     article_text: string;
+}
+
+// --- Updated ImageGenRequest Interface (matching Rust) ---
+interface ImageGenRequest {
+    prompt: string;
+    rendering_speed?: string; // Optional
+    aspect_ratio?: string;    // Optional
 }
 
 interface ImageGenResponse {
@@ -37,9 +46,11 @@ interface ImageGenResponse {
 // --- Updated Request Interface ---
 interface FullArticleRequest {
     tool_name: string;
-    article_goal_prompt: string; // Send the goal
-    example_url: string;         // Send the example URL
-    sections: SectionDefinitionData[]; // Send instructions only
+    article_goal_prompt: string;
+    example_url: string;
+    sections: SectionDefinitionData[];
+    model: string;
+    target_word_count: number;
 }
 
 // --- NEW Response Interface for Suggestions ---
@@ -55,6 +66,14 @@ interface SuggestImagePromptsRequest {
 // --- NEW Type for storing image generation results per prompt ---
 type ImageGenResults = Record<number, ImageGenResponse>; // Keyed by prompt index
 
+// --- Define possible aspect ratios ---
+const ideogramAspectRatios = ["1x1", "16x9", "9x16", "4x3", "3x4", "10x16", "16x10", "1x3", "3x1", "1x2", "2x1", "2x3", "3x2", "4x5", "5x4"] as const;
+type AspectRatio = typeof ideogramAspectRatios[number];
+
+// --- Define possible text generation models ---
+const textGenerationModels = ["gpt-4o", "gpt-4-turbo", "gpt-4.1", "gpt-3.5-turbo"] as const; // Example models
+type TextModel = typeof textGenerationModels[number];
+
 interface ProjectPageProps {
   projectName: string;
   displayFeedback: DisplayFeedback;
@@ -64,6 +83,10 @@ interface ProjectPageProps {
 
 let nextSectionId = 1;
 const getNewSectionId = () => nextSectionId++;
+
+// --- Defaults ---
+const DEFAULT_TEXT_MODEL: TextModel = "gpt-4o";
+const DEFAULT_WORD_COUNT = 1000;
 
 function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: ProjectPageProps) {
   // --- State ---
@@ -76,6 +99,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   const [testImagePrompt, setTestImagePrompt] = useState("");
   const [testImageResult, setTestImageResult] = useState<ImageGenResponse | null>(null);
   const [isTestingImage, setIsTestingImage] = useState(false);
+  const [testImageAspectRatio, setTestImageAspectRatio] = useState<AspectRatio>("16x9"); // Default aspect ratio for test
 
   // State specifically for the inputs managed in the base settings form
   const [articleGoalPromptInput, setArticleGoalPromptInput] = useState("");
@@ -89,6 +113,14 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   // --- NEW Image Generation State (per prompt) ---
   const [imageGenResults, setImageGenResults] = useState<ImageGenResults>({});
   const [isGeneratingImage, setIsGeneratingImage] = useState<Record<number, boolean>>({}); // Track loading per prompt
+  const [promptAspectRatios, setPromptAspectRatios] = useState<Record<number, AspectRatio>>({}); // Store aspect ratio per prompt
+
+  // --- NEW Article Config State ---
+  const [textModelInput, setTextModelInput] = useState<TextModel>(DEFAULT_TEXT_MODEL);
+  const [wordCountInput, setWordCountInput] = useState<string>(String(DEFAULT_WORD_COUNT)); // Store as string for input
+
+  // --- NEW State for publishing
+  const [isPublishing, setIsPublishing] = useState(false);
 
   // --- ADD LOGGING INSIDE RENDER ---
   console.log("[ProjectPage Render] generatedArticle state:", generatedArticle ? generatedArticle.substring(0, 100) + "..." : generatedArticle);
@@ -96,28 +128,33 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
 
   const fetchProjectSettings = useCallback(async (name: string) => {
         setIsLoadingSettings(true);
-        setSectionDefinitions([]); // Clear previous sections
-        setArticleGoalPromptInput(""); // Clear inputs
-        setExampleUrlInput("");      // Clear inputs
+        setSectionDefinitions([]);
+        setArticleGoalPromptInput("");
+        setExampleUrlInput("");
         setToolNameInput("");
         // --- ADD Reset for new state ---
+        setTextModelInput(DEFAULT_TEXT_MODEL); // Reset model
+        setWordCountInput(String(DEFAULT_WORD_COUNT)); // Reset word count
         setGeneratedArticle(null);
         setSuggestedPrompts(null); // Clear suggestions
         setEditedPrompts({});
         setImageGenResults({});
         setIsGeneratingImage({});
+        setPromptAspectRatios({}); // Reset aspect ratios
+        setTestImageAspectRatio("16x9"); // Reset test aspect ratio
         // --- END Reset ---
         try {
             const settings = await invoke<ProjectSettings | null>(
                 "get_project_settings", { name: name }
             );
             if (settings) {
-                setCurrentSettings(settings); // Store the full loaded settings
+                setCurrentSettings(settings);
                 setToolNameInput(settings.toolName || name);
-
-                // Populate specific input fields from loaded settings
                 setArticleGoalPromptInput(settings.article_goal_prompt || "");
                 setExampleUrlInput(settings.example_url || "");
+                // Set model and word count from loaded settings, falling back to defaults
+                setTextModelInput(settings.text_generation_model as TextModel || DEFAULT_TEXT_MODEL);
+                setWordCountInput(String(settings.target_word_count || DEFAULT_WORD_COUNT));
 
                 // Load Sections
                 if (settings.sections && settings.sections.length > 0) {
@@ -133,16 +170,30 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                 }
 
             } else {
-                 displayFeedback(`Settings not found for project ${name}. Returning home.`, "error");
-                 onBack();
+                 // Use default values if settings are null
+                 setCurrentSettings({
+                     wordpress_url: "", wordpress_user: "", wordpress_pass: "",
+                     toolName: name, article_goal_prompt: "", example_url: "", sections: [],
+                     text_generation_model: DEFAULT_TEXT_MODEL, target_word_count: DEFAULT_WORD_COUNT
+                 });
+                 setToolNameInput(name);
+                 setTextModelInput(DEFAULT_TEXT_MODEL);
+                 setWordCountInput(String(DEFAULT_WORD_COUNT));
+                 setSectionDefinitions([
+                     { id: getNewSectionId(), instructions: "Write an engaging introduction for [Tool Name]..." }
+                 ]);
+                 displayFeedback(`Created default settings for new project ${name}.`, "success");
             }
         } catch (err) {
             console.error("Failed to fetch project settings:", err);
             displayFeedback(`Error fetching settings for ${name}: ${err}`, "error");
-            setCurrentSettings(null);
-             setSectionDefinitions([
+            setCurrentSettings(null); // Indicate error state
+            // Keep default inputs
+            setTextModelInput(DEFAULT_TEXT_MODEL);
+            setWordCountInput(String(DEFAULT_WORD_COUNT));
+            setSectionDefinitions([
                  { id: getNewSectionId(), instructions: "Error loading sections..." }
-             ]);
+            ]);
         } finally {
             setIsLoadingSettings(false);
         }
@@ -155,54 +206,59 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
 
   // --- Save Handlers ---
   const handleSaveBaseSettings = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!currentSettings) return;
-    displayFeedback(`Saving base settings for ${projectName}...`, "success");
+     e.preventDefault();
+     if (!currentSettings) return;
+     displayFeedback(`Saving base settings for ${projectName}...`, "success");
 
-    // Prepare payload ONLY with WP details from currentSettings state
-    // Ensures goal/url/sections from currentSettings are preserved unless saved via Article Config save
-    const settingsToSave: ProjectSettings = {
-        wordpress_url: currentSettings.wordpress_url,
-        wordpress_user: currentSettings.wordpress_user,
-        wordpress_pass: currentSettings.wordpress_pass,
-        // Keep the previously loaded/saved values for these
-        toolName: currentSettings.toolName || projectName,
-        article_goal_prompt: currentSettings.article_goal_prompt || "",
-        example_url: currentSettings.example_url || "",
-        sections: currentSettings.sections || []
-    };
+     // Prepare payload ONLY with WP details + PREVIOUSLY SAVED article config details
+     const settingsToSave: ProjectSettings = {
+         wordpress_url: currentSettings.wordpress_url, // Use WP values from form state if needed, or currentSettings
+         wordpress_user: currentSettings.wordpress_user,
+         wordpress_pass: currentSettings.wordpress_pass,
+         // Keep the previously loaded/saved values for these unless changed in Article Config
+         toolName: currentSettings.toolName || projectName,
+         article_goal_prompt: currentSettings.article_goal_prompt || "",
+         example_url: currentSettings.example_url || "",
+         sections: currentSettings.sections || [],
+         text_generation_model: currentSettings.text_generation_model || DEFAULT_TEXT_MODEL,
+         target_word_count: currentSettings.target_word_count || DEFAULT_WORD_COUNT,
+     };
 
-    try {
-        await invoke("save_project_settings", { name: projectName, settings: { ...settingsToSave, tool_name: settingsToSave.toolName } });
-        displayFeedback(`Base settings for '${projectName}' saved!`, "success");
-        // Update the main settings state after successful save
-        setCurrentSettings(settingsToSave);
-    } catch (err) {
-        console.error("Failed to save base project settings:", err);
-        displayFeedback(`Error saving base settings: ${err}`, "error");
-    }
+     try {
+         // Send the correct structure expected by Rust backend
+         await invoke("save_project_settings", { name: projectName, settings: settingsToSave });
+         displayFeedback(`Base settings for '${projectName}' saved!`, "success");
+         // Update the main settings state AFTER successful save
+         setCurrentSettings(settingsToSave);
+     } catch (err) {
+         console.error("Failed to save base project settings:", err);
+         displayFeedback(`Error saving base settings: ${err}`, "error");
+     }
   };
+
 
   const handleSaveArticleConfig = async () => {
       if (!currentSettings) {
           displayFeedback("Cannot save article config: base settings not loaded.", "error");
           return;
       }
-       // Basic validation for the fields being saved by this action
-        if (!toolNameInput.trim()) {
-           displayFeedback("Please enter the Tool Name before saving.", "error");
-           return;
+       // Basic validation
+       if (!toolNameInput.trim()) {
+           displayFeedback("Please enter the Tool Name before saving.", "error"); return;
        }
-        if (!articleGoalPromptInput.trim()) {
-           displayFeedback("Please enter the Article Goal/Description before saving.", "error");
-           return;
+       if (!articleGoalPromptInput.trim()) {
+           displayFeedback("Please enter the Article Goal/Description before saving.", "error"); return;
        }
+       const wordCountNum = parseInt(wordCountInput, 10);
+       if (isNaN(wordCountNum) || wordCountNum <= 0) {
+           displayFeedback("Please enter a valid positive number for Target Word Count.", "error"); return;
+       }
+
 
        displayFeedback(`Saving article configuration for ${projectName}...`, "success");
 
-       // Prepare payload, keeping existing WP details but updating goal, url, and sections
+       // Prepare payload, keeping existing WP details but updating the rest from inputs
        const settingsToSave: ProjectSettings = {
-           // Keep existing WP URL/User/Pass from loaded state
            wordpress_url: currentSettings.wordpress_url,
            wordpress_user: currentSettings.wordpress_user,
            wordpress_pass: currentSettings.wordpress_pass,
@@ -210,12 +266,14 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
            toolName: toolNameInput,
            article_goal_prompt: articleGoalPromptInput,
            example_url: exampleUrlInput,
-           // Update sections from editor state
-           sections: sectionDefinitions.map(({ id, ...rest }) => rest)
+           sections: sectionDefinitions.map(({ id, ...rest }) => rest), // Update sections from editor state
+           text_generation_model: textModelInput, // Save selected model
+           target_word_count: wordCountNum, // Save parsed word count
        };
 
        try {
-           await invoke("save_project_settings", { name: projectName, settings: { ...settingsToSave, tool_name: settingsToSave.toolName } });
+            // Send the correct structure expected by Rust backend
+           await invoke("save_project_settings", { name: projectName, settings: settingsToSave });
            displayFeedback(`Article configuration for '${projectName}' saved!`, "success");
            // Update local state to reflect ALL saved settings
            setCurrentSettings(settingsToSave);
@@ -235,7 +293,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
 
   const handleDeleteClick = () => {
       console.log(`[ProjectPage] handleDeleteClick called for: ${projectName}`);
-      alert(`[ProjectPage] handleDeleteClick called for: ${projectName}. Now calling onDelete prop.`); // Add alert as backup
+      //alert(`[ProjectPage] handleDeleteClick called for: ${projectName}. Now calling onDelete prop.`); // Remove alert
       onDelete(projectName); // Call the delete handler passed from App
   };
 
@@ -280,54 +338,45 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   };
 
   // --- Updated Article Generation Handler ---
-  const handleGenerateFullArticle = async (e?: FormEvent) => { // Make event optional
+  const handleGenerateFullArticle = async (e?: FormEvent) => {
       e?.preventDefault();
 
       // --- Validation ---
-      // No change needed for settings check
-       if (!currentSettings) {
-           displayFeedback("Settings not loaded. Cannot generate article.", "error");
-           return;
-       }
-      // No change needed for toolName check
+      if (!currentSettings) {
+           displayFeedback("Settings not loaded. Cannot generate article.", "error"); return;
+      }
       if (!toolNameInput.trim()) {
-          displayFeedback("Please enter the Tool Name.", "error");
-          return;
+          displayFeedback("Please enter the Tool Name.", "error"); return;
       }
-       // Check the INPUT STATE for the goal prompt
       if (!articleGoalPromptInput.trim()) {
-           // Updated error message to be more accurate
-           displayFeedback("Please fill in the Article Goal/Description.", "error");
-           return;
+           displayFeedback("Please fill in the Article Goal/Description.", "error"); return;
       }
-       // No change needed for section checks
-       if (sectionDefinitions.length === 0) {
-           displayFeedback("Please add at least one section.", "error");
-           return;
+      const wordCountNum = parseInt(wordCountInput, 10); // Parse word count
+      if (isNaN(wordCountNum) || wordCountNum <= 50) { // Basic check
+           displayFeedback("Please enter a valid Target Word Count (at least 50).", "error"); return;
+      }
+      if (sectionDefinitions.length === 0) {
+           displayFeedback("Please add at least one section.", "error"); return;
        }
        if (sectionDefinitions.some(sec => !sec.instructions.trim())) {
-           displayFeedback("Please fill in instructions for all sections.", "error");
-           return;
+           displayFeedback("Please fill in instructions for all sections.", "error"); return;
        }
       // --- End Validation ---
 
 
       setIsGenerating(true);
       setGeneratedArticle(null);
-      // --- ADD Reset for image prompt state when generating new article ---
-      setSuggestedPrompts(null); // Clear previous suggestions
-      setEditedPrompts({});
-      setImageGenResults({});
-      setIsGeneratingImage({});
-      // --- END Reset ---
+      // ... reset image prompt state ...
       displayFeedback("Generating full article...", "warning");
 
-      // Prepare payload using current input state for goal/url and editor state for sections
+      // Prepare payload using current INPUT states
       const requestPayload: FullArticleRequest = {
-          tool_name: toolNameInput, // Use toolName state variable
-          article_goal_prompt: articleGoalPromptInput, // Use INPUT STATE
-          example_url: exampleUrlInput || "",          // Use INPUT STATE
-          sections: sectionDefinitions.map(({ id, ...rest }) => rest), // Use section editor state
+          tool_name: toolNameInput,
+          article_goal_prompt: articleGoalPromptInput,
+          example_url: exampleUrlInput || "",
+          sections: sectionDefinitions.map(({ id, ...rest }) => rest),
+          model: textModelInput, // Send selected model
+          target_word_count: wordCountNum, // Send parsed word count
       };
 
       try {
@@ -335,15 +384,14 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
           const response = await invoke<ArticleResponse>("generate_full_article", { request: requestPayload });
           console.log("Frontend received response from invoke:", response);
           if (response && response.article_text) {
-             console.log("Attempting to set generatedArticle state with:", response.article_text.substring(0, 200) + "..."); // Log beginning of text
+             console.log("Attempting to set generatedArticle state with:", response.article_text.substring(0, 200) + "...");
              setGeneratedArticle(response.article_text);
              displayFeedback("Full article generated successfully!", "success");
           } else {
              console.error("Frontend received response but article_text is missing or empty:", response);
              displayFeedback("Received response, but article content was missing.", "error");
-             setGeneratedArticle(null); // Ensure state is nullified if response is bad
+             setGeneratedArticle(null);
           }
-
       } catch(err) {
           console.error("Full article generation failed:", err);
           const errorMsg = err instanceof Error ? err.message : String(err);
@@ -365,18 +413,22 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
     setEditedPrompts({});
     setImageGenResults({});
     setIsGeneratingImage({});
+    setPromptAspectRatios({}); // Reset aspect ratios
     displayFeedback("Suggesting image prompts...", "warning");
 
     try {
         const request: SuggestImagePromptsRequest = { article_text: generatedArticle };
         const response = await invoke<SuggestImagePromptsResponse>("suggest_image_prompts", { request });
         setSuggestedPrompts(response.prompts);
-        // Initialize edited prompts state
+        // Initialize edited prompts state and aspect ratios
         const initialEdits: Record<number, string> = {};
+        const initialRatios: Record<number, AspectRatio> = {};
         response.prompts.forEach((prompt, index) => {
             initialEdits[index] = prompt; // Start with suggested prompt
+            initialRatios[index] = "16x9"; // Default aspect ratio
         });
         setEditedPrompts(initialEdits);
+        setPromptAspectRatios(initialRatios); // Set initial aspect ratios
         displayFeedback("Image prompts suggested.", "success");
     } catch (err) {
         console.error("Failed to suggest image prompts:", err);
@@ -396,9 +448,26 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
       }));
   };
 
+  // --- NEW Handler for Prompt Aspect Ratio Change ---
+  const handlePromptAspectRatioChange = (index: number, value: string) => {
+        // Basic type guard to ensure the value is one of the allowed AspectRatios
+        const isValidRatio = (r: string): r is AspectRatio => ideogramAspectRatios.includes(r as AspectRatio);
+        if (isValidRatio(value)) {
+            setPromptAspectRatios(prev => ({
+                ...prev,
+                [index]: value
+            }));
+        } else {
+            console.warn(`Invalid aspect ratio selected: ${value}`);
+        }
+  };
+
+
   // --- NEW Handler for Generating Image for a SPECIFIC Prompt ---
   const handleGenerateSpecificImage = async (index: number) => {
       const promptToUse = editedPrompts[index]; // Get current value from state
+      const aspectRatioToUse = promptAspectRatios[index] || "16x9"; // Get aspect ratio or default
+
       if (!promptToUse || !promptToUse.trim()) {
           displayFeedback(`Please enter a prompt for image ${index + 1}.`, "error");
           return;
@@ -406,12 +475,18 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
 
       setIsGeneratingImage(prev => ({ ...prev, [index]: true })); // Set loading for this specific image
       setImageGenResults(prev => ({ ...prev, [index]: { image_url: null, error: null } })); // Clear previous result
-      displayFeedback(`Requesting image ${index + 1} for: "${promptToUse.substring(0, 30)}..."`, "success");
+      displayFeedback(`Requesting image ${index + 1} (${aspectRatioToUse}) for: "${promptToUse.substring(0, 30)}..."`, "success");
 
       try {
-          // Assuming ImageGenRequest is defined elsewhere or in Rust code only for now
+          // Prepare the request payload including aspect ratio
+          const imageRequestPayload: ImageGenRequest = {
+              prompt: promptToUse,
+              aspect_ratio: aspectRatioToUse,
+              // rendering_speed could be added here if needed
+          };
+
           const response = await invoke<ImageGenResponse>("generate_ideogram_image", {
-              request: { prompt: promptToUse } // Send the current prompt text
+              request: imageRequestPayload // Send the updated payload
           });
           setImageGenResults(prev => ({ ...prev, [index]: response })); // Store result for this index
 
@@ -441,11 +516,17 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
       }
       setIsTestingImage(true);
       setTestImageResult(null);
-      displayFeedback(`Requesting test image for: "${testImagePrompt}"...`, "success");
+      displayFeedback(`Requesting test image (${testImageAspectRatio}) for: "${testImagePrompt}"...`, "success");
 
       try {
+          // Prepare request payload including aspect ratio
+          const testImageRequestPayload: ImageGenRequest = {
+              prompt: testImagePrompt,
+              aspect_ratio: testImageAspectRatio,
+              // rendering_speed could be added here if needed
+          };
           const response = await invoke<ImageGenResponse>("generate_ideogram_image", {
-              request: { prompt: testImagePrompt }
+              request: testImageRequestPayload // Send updated payload
           });
           setTestImageResult(response); // Store the full response object
 
@@ -467,6 +548,48 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
       }
   };
 
+  // --- Handler for Test Image Aspect Ratio Change ---
+  const handleTestAspectRatioChange = (e: ChangeEvent<HTMLSelectElement>) => {
+        const value = e.target.value;
+        const isValidRatio = (r: string): r is AspectRatio => ideogramAspectRatios.includes(r as AspectRatio);
+        if (isValidRatio(value)) {
+            setTestImageAspectRatio(value);
+        } else {
+             console.warn(`Invalid aspect ratio selected for test: ${value}`);
+        }
+  };
+
+  // --- NEW WordPress Publishing Handler ---
+  const handlePublishToWordPress = async () => {
+      if (!generatedArticle) {
+          displayFeedback("No generated article available to publish.", "error");
+          return;
+      }
+       if (!currentSettings || !currentSettings.wordpress_url || !currentSettings.wordpress_user || !currentSettings.wordpress_pass) {
+           displayFeedback("WordPress URL, User, and Application Password must be configured in Base Settings.", "error");
+           return;
+       }
+
+       setIsPublishing(true);
+       displayFeedback("Publishing article to WordPress...", "warning");
+
+       try {
+           const requestPayload: { project_name: string; article_html: string; publish_status?: string } = {
+                project_name: projectName,
+                article_html: generatedArticle,
+                publish_status: "publish" // Or "draft", or make this configurable later
+           };
+           const successMessage = await invoke<string>("publish_to_wordpress", { request: requestPayload });
+           displayFeedback(successMessage, "success");
+       } catch (err) {
+           console.error("Failed to publish to WordPress:", err);
+           const errorMsg = err instanceof Error ? err.message : String(err);
+           displayFeedback(`Error publishing to WordPress: ${errorMsg}`, "error");
+       } finally {
+           setIsPublishing(false);
+       }
+  };
+
   return (
     <div className="page-container">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '25px' }}>
@@ -474,6 +597,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
              <button onClick={onBack} disabled={isGenerating || isTestingImage}>&larr; Back to Projects</button>
         </div>
 
+        {/* --- Article Configuration Card --- */}
         <div className="card">
             <h2>Article Configuration</h2>
             <div>
@@ -512,6 +636,37 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                         onChange={(e) => setExampleUrlInput(e.target.value)}
                         placeholder="https://www.example-review.com/some-article"
                         disabled={isGenerating || isLoadingSettings} />
+                </div>
+
+                {/* --- NEW Model Selection --- */}
+                <div className="row" style={{marginTop: '15px'}}>
+                    <label htmlFor="textModel">Text Generation Model:</label>
+                    <select
+                        id="textModel"
+                        value={textModelInput}
+                        onChange={(e) => setTextModelInput(e.target.value as TextModel)}
+                        disabled={isGenerating || isLoadingSettings}
+                    >
+                        {textGenerationModels.map(model => (
+                            <option key={model} value={model}>{model}</option>
+                        ))}
+                    </select>
+                </div>
+
+                {/* --- NEW Target Word Count --- */}
+                <div className="row" style={{marginTop: '15px'}}>
+                    <label htmlFor="wordCount">Target Word Count:</label>
+                    <input
+                        type="number"
+                        id="wordCount"
+                        value={wordCountInput}
+                        onChange={(e) => setWordCountInput(e.target.value)}
+                        min="50" // Set a minimum
+                        step="50"
+                        placeholder="e.g., 1000"
+                        disabled={isGenerating || isLoadingSettings}
+                        style={{ width: '100px' }} // Adjust width if needed
+                    />
                 </div>
 
                 {/* Dynamic Section Inputs */}
@@ -565,30 +720,42 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                  <button
                      type="button"
                      onClick={() => handleGenerateFullArticle()}
-                     disabled={isGenerating || isLoadingSettings || sectionDefinitions.length === 0 || !toolNameInput.trim() || !articleGoalPromptInput.trim()}
+                     disabled={isGenerating || isLoadingSettings || sectionDefinitions.length === 0 || !toolNameInput.trim() || !articleGoalPromptInput.trim() || !wordCountInput || parseInt(wordCountInput) <=0 }
                      style={{ marginTop: '20px', display: 'block', width: '100%' }}>
                      {isGenerating ? "Generating..." : "Generate Full Article"}
                  </button>
              </div>
-              {/* Display Generated Article Area - REMOVED outer conditional */}
+              {/* Display Generated Article Area */}
                  <div className="generated-article-container" style={{ marginTop: '20px', borderTop: '1px solid #eee', paddingTop: '20px' }}>
                      <h3>Generated Full Article HTML:</h3>
                      <textarea
                         readOnly
-                        // Display placeholder if article is null, or the article itself
                         value={generatedArticle || "Article will appear here after generation..."}
                         placeholder="Article will appear here after generation..." // Added placeholder
                         style={{ width: '100%', minHeight: '400px', whiteSpace: 'pre-wrap', wordWrap: 'break-word', background: '#f9f9f9', padding: '15px', borderRadius: '4px', border: '1px solid #ccc', boxSizing: 'border-box', fontFamily: 'monospace' }}
                      />
-                     {/* --- Button to Suggest Prompts - Now uses defined state/handler --- */}
-                     <button
-                        type="button"
-                        onClick={handleSuggestImagePrompts}
-                        disabled={isGenerating || isSuggestingPrompts || !generatedArticle} // Uses defined state
-                        style={{ marginTop: '15px' }}
-                    >
-                        {isSuggestingPrompts ? 'Suggesting...' : 'Suggest Image Prompts'} {/* Uses defined state */}
-                    </button>
+                     {/* Button Group for Generated Article */}
+                     <div style={{ marginTop: '15px', display: 'flex', gap: '10px' }}>
+                         {/* Button to Suggest Prompts */}
+                         <button
+                            type="button"
+                            onClick={handleSuggestImagePrompts}
+                            disabled={isGenerating || isSuggestingPrompts || isPublishing || !generatedArticle} // Disable while publishing
+                            // style={{ }} // Keep existing styles if any
+                        >
+                            {isSuggestingPrompts ? 'Suggesting...' : 'Suggest Image Prompts'}
+                        </button>
+
+                        {/* --- NEW Publish Button --- */}
+                        <button
+                            type="button"
+                            onClick={handlePublishToWordPress}
+                            disabled={isGenerating || isSuggestingPrompts || isPublishing || !generatedArticle || !currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass}
+                            title={(!currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass) ? "Configure WP settings first" : "Publish to WordPress"}
+                        >
+                            {isPublishing ? 'Publishing...' : 'Publish to WordPress'}
+                        </button>
+                     </div>
                  </div>
         </div>
 
@@ -597,38 +764,58 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
             <div className="card">
                 <h2>Image Prompt Suggestions</h2>
                 {suggestedPrompts.map((_, index) => (
-                    <div key={`prompt-${index}`} className="prompt-generation-row" style={{ marginBottom: '20px', paddingBottom: '20px', borderBottom: '1px solid #eee' }}>
-                        <label htmlFor={`prompt-input-${index}`} style={{ display: 'block', marginBottom: '5px' }}>Prompt {index + 1}:</label>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                            <textarea
-                                id={`prompt-input-${index}`}
-                                value={editedPrompts[index] || ''} // Use edited prompt state
-                                onChange={(e) => handleEditedPromptChange(index, e.target.value)} // Use handler
-                                rows={3}
-                                placeholder={`Edit suggested prompt ${index + 1}...`}
-                                disabled={isGeneratingImage[index] || isGenerating || isSuggestingPrompts} // Use states
-                                style={{ flexGrow: 1, minHeight: '60px' }}
-                            />
-                            <button
-                                type="button"
-                                onClick={() => handleGenerateSpecificImage(index)} // Use handler
-                                disabled={isGeneratingImage[index] || !editedPrompts[index]?.trim()} // Use states
-                                style={{ height: '60px', alignSelf: 'stretch' }} // Match height roughly
-                            >
-                                {isGeneratingImage[index] ? 'Generating...' : 'Generate Image'} {/* Use state */}
-                            </button>
+                    // --- Wrap each prompt section for better styling/separation ---
+                    <div key={`prompt-${index}`} className="image-prompt-section" style={{ marginBottom: '25px', paddingBottom: '25px', borderBottom: '1px solid #eee' }}>
+                        <label htmlFor={`prompt-input-${index}`} style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold' }}>Prompt {index + 1}:</label>
+                        {/* Textarea for the prompt */}
+                        <textarea
+                            id={`prompt-input-${index}`}
+                            value={editedPrompts[index] || ''}
+                            onChange={(e) => handleEditedPromptChange(index, e.target.value)}
+                            rows={3}
+                            placeholder={`Edit suggested prompt ${index + 1}...`}
+                            disabled={isGeneratingImage[index] || isGenerating || isSuggestingPrompts}
+                            style={{ width: '100%', minHeight: '60px', marginBottom: '10px', boxSizing: 'border-box' }} // Ensure full width and add margin
+                        />
+                        {/* --- Controls Row (Dropdown + Button) --- */}
+                        <div className="row" style={{ marginBottom: '15px', gap: '15px' }}>
+                            {/* Aspect Ratio Selector */}
+                            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1 }}> {/* Allow grow */}
+                                <label htmlFor={`prompt-aspect-${index}`} style={{ marginBottom: '3px', textAlign: 'left', minWidth: 'auto' }}>Aspect Ratio:</label>
+                                <select
+                                    id={`prompt-aspect-${index}`}
+                                    value={promptAspectRatios[index] || "16x9"}
+                                    onChange={(e) => handlePromptAspectRatioChange(index, e.target.value)}
+                                    disabled={isGeneratingImage[index] || isGenerating || isSuggestingPrompts}
+                                >
+                                    {ideogramAspectRatios.map(ratio => (
+                                        <option key={ratio} value={ratio}>{ratio}</option>
+                                    ))}
+                                </select>
+                            </div>
+                            {/* Generate Button */}
+                            <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}> {/* Align button */}
+                                <button
+                                    type="button"
+                                    onClick={() => handleGenerateSpecificImage(index)}
+                                    disabled={isGeneratingImage[index] || !editedPrompts[index]?.trim()}
+                                >
+                                    {isGeneratingImage[index] ? 'Generating...' : 'Generate Image'}
+                                </button>
+                            </div>
                         </div>
+
                         {/* Display Result for this prompt */}
-                        {imageGenResults[index] && ( // Use state
-                             <div style={{ marginTop: '10px' }}>
+                        {imageGenResults[index] && (
+                             <div className="image-result-area" style={{ marginTop: '10px' }}>
                                  {imageGenResults[index].error && <p style={{ color: 'red' }}>Error: {imageGenResults[index].error}</p>}
                                  {imageGenResults[index].image_url && (
                                      <div>
-                                        <p>Generated Image {index + 1}:</p>
+                                        <p style={{ marginBottom: '5px', fontWeight: '500' }}>Generated Image:</p>
                                          <img
-                                            src={imageGenResults[index].image_url!} // Use non-null assertion or check
+                                            src={imageGenResults[index].image_url!}
                                             alt={`Generated image for prompt ${index + 1}`}
-                                            style={{ maxWidth: '100%', maxHeight: '300px', height: 'auto', marginTop: '5px', border: '1px solid #ddd' }}
+                                            style={{ maxWidth: '100%', maxHeight: '350px', height: 'auto', marginTop: '5px', border: '1px solid #ddd', borderRadius: '4px' }}
                                           />
                                      </div>
                                  )}
@@ -639,6 +826,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
             </div>
         )}
 
+        {/* --- Project Base Settings Card --- */}
         <div className="card">
             <h2>Project Base Settings</h2>
             {isLoadingSettings && <p>Loading settings...</p>}

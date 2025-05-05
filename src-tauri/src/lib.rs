@@ -1,3 +1,4 @@
+use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::multipart;
 use reqwest::Client;
@@ -19,22 +20,26 @@ struct SectionDefinitionData {
     instructions: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct ProjectSettings {
-    #[serde(default)]
+    #[serde(default = "default_string")]
     wordpress_url: String,
-    #[serde(default)]
+    #[serde(default = "default_string")]
     wordpress_user: String,
-    #[serde(default)]
+    #[serde(default = "default_string")]
     wordpress_pass: String,
-    #[serde(default)]
+    #[serde(default = "default_string")]
     tool_name: String,
-    #[serde(default)]
+    #[serde(default = "default_string")]
     article_goal_prompt: String,
-    #[serde(default)]
+    #[serde(default = "default_string")]
     example_url: String,
-    #[serde(default)]
+    #[serde(default = "default_sections")]
     sections: Vec<SectionDefinitionData>,
+    #[serde(default = "default_text_model")]
+    text_generation_model: String,
+    #[serde(default = "default_word_count")]
+    target_word_count: u32,
 }
 
 type ProjectsMap = HashMap<String, ProjectSettings>;
@@ -54,6 +59,7 @@ struct ArticleResponse {
 struct ImageGenRequest {
     prompt: String,
     rendering_speed: Option<String>,
+    aspect_ratio: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -117,6 +123,8 @@ struct FullArticleRequest {
     article_goal_prompt: String,
     example_url: String,
     sections: Vec<SectionDefinitionData>,
+    model: String,
+    target_word_count: u32,
 }
 
 #[derive(Deserialize, Debug)]
@@ -151,6 +159,20 @@ struct SuggestImagePromptsRequest {
 #[derive(Serialize, Debug)]
 struct SuggestImagePromptsResponse {
     prompts: Vec<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PublishRequest {
+    project_name: String,
+    article_html: String,
+    publish_status: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct WordPressPostPayload<'a> {
+    title: &'a str,
+    content: &'a str,
+    status: &'a str,
 }
 
 #[tauri::command]
@@ -223,11 +245,23 @@ async fn create_project(app: tauri::AppHandle, name: String) -> Result<(), Strin
                 return Err(format!("Project '{}' already exists.", name));
             }
 
-            projects.insert(name.clone(), ProjectSettings::default());
+            let default_settings = ProjectSettings {
+                wordpress_url: default_string(),
+                wordpress_user: default_string(),
+                wordpress_pass: default_string(),
+                tool_name: name.clone(),
+                article_goal_prompt: default_string(),
+                example_url: default_string(),
+                sections: default_sections(),
+                text_generation_model: default_text_model(),
+                target_word_count: default_word_count(),
+            };
+            projects.insert(name.clone(), default_settings);
 
             s.set(
                 STORE_KEY_PROJECTS.to_string(),
-                serde_json::to_value(projects).unwrap(),
+                serde_json::to_value(projects)
+                    .map_err(|e| format!("Failed to serialize projects: {}", e))?,
             );
 
             s.save()
@@ -363,6 +397,9 @@ async fn generate_ideogram_image(
         "Rust: Received image generation request for prompt: {}",
         request.prompt
     );
+    if let Some(ratio) = &request.aspect_ratio {
+        println!("Rust: Using aspect ratio: {}", ratio);
+    }
 
     let api_key = get_api_key(app.clone(), STORE_KEY_IMAGE_API.to_string())
         .await?
@@ -377,10 +414,15 @@ async fn generate_ideogram_image(
     );
 
     let mut form = multipart::Form::new().text("prompt", request.prompt);
+
     if let Some(speed) = request.rendering_speed {
         form = form.text("rendering_speed", speed);
     } else {
         form = form.text("rendering_speed", "TURBO");
+    }
+
+    if let Some(ratio) = request.aspect_ratio {
+        form = form.text("aspect_ratio", ratio);
     }
 
     println!(
@@ -446,6 +488,8 @@ async fn generate_full_article(
     app: tauri::AppHandle,
 ) -> Result<ArticleResponse, String> {
     println!("Generating full article for tool: {}", request.tool_name);
+    println!("Using model: {}", request.model);
+    println!("Targeting word count: {}", request.target_word_count);
     println!("Using article goal: {}", request.article_goal_prompt);
     println!("Using example URL: {}", request.example_url);
     println!(
@@ -476,11 +520,11 @@ Vérifier les données pour 2025 afin d'assurer leur actualité et leur précisi
 Éviter toute confusion avec des outils similaires (ex. Groq vs Grok).
 
 Structure de l'article :
-Based on the instructions below, create distinct sections with appropriate H2 titles.
+Based on the instructions below, create distinct sections with appropriate H2 titles. Develop each section thoroughly based on its instructions.
 {dynamic_sections}
 
 Rédaction :
-Produire un article de minimum 1000 mots en HTML, incluant :
+Produire un article de minimum {target_word_count} mots en HTML, incluant :
 Balise <title> : Optimisée pour le SEO, 60-70 caractères, avec des mots-clés comme "avis", "fonctionnalités", "tarifs", "{tool_name}", "2025" (ex. "Avis {tool_name} 2025 : fonctionnalités, tarifs, alternatives").
 Balise <meta description> : 150-160 caractères, incluant un call-to-action engageant (ex. "Découvrez {tool_name} : fonctionnalités, tarifs, avis. Boostez vos projets IA !").
 Balise <h1> : Optimisée pour le lecteur, engageante, différente du <title>, axée sur un bénéfice clé (ex. "Pourquoi {tool_name} révolutionne vos projets IA en 2025").
@@ -490,11 +534,13 @@ Style CSS : Intégré dans la balise <style> pour un tableau esthétique (bordur
 Respecter les conventions typographiques françaises : minuscules sauf pour débuts de phrases, titres, et noms propres.
 Utiliser un ton engageant, professionnel, et accessible, avec des exemples concrets pour illustrer les cas d'usage.
 Assurez-vous que la sortie est uniquement le code HTML complet de l'article, en commençant par <!DOCTYPE html> ou <html> et se terminant par </html>. N'incluez AUCUN texte ou explication avant ou après le code HTML.
+IMPORTANT: The final article content within the HTML MUST contain at least {target_word_count} words. Expand significantly on each section's instructions to achieve this length.
 "#,
         user_goal_prompt = request.article_goal_prompt,
         example_url = request.example_url,
         tool_name = request.tool_name,
-        dynamic_sections = dynamic_sections_prompt_part
+        dynamic_sections = dynamic_sections_prompt_part,
+        target_word_count = request.target_word_count
     );
 
     println!(
@@ -510,11 +556,11 @@ Assurez-vous que la sortie est uniquement le code HTML complet de l'article, en 
     let api_url = "https://api.openai.com/v1/chat/completions";
 
     let request_body = serde_json::json!({
-        "model": "gpt-4-turbo",
+        "model": request.model,
         "messages": [
             {
                 "role": "system",
-                "content": "You are a helpful assistant tasked with writing detailed AI tool review articles in French HTML format based on user instructions and web searches. Generate appropriate H2 titles for each section based on the provided instructions."
+                "content": format!("You are a helpful assistant tasked with writing detailed AI tool review articles in French HTML format based on user instructions and web searches. Generate appropriate H2 titles for each section based on the provided instructions. Prioritize reaching the target word count of {}.", request.target_word_count)
             },
             {
                 "role": "user",
@@ -589,14 +635,14 @@ async fn suggest_image_prompts(
     let suggestion_prompt = format!(
         r#"Based on the following article text, suggest 3-5 diverse image prompts suitable for illustrating it. Focus on key themes, concepts, or visual metaphors described in the text.
 
-Output ONLY a valid JSON array of strings, where each string is a suggested image prompt. Example output format: ["prompt idea 1", "prompt idea 2", "a third idea"]
+        Output ONLY a valid JSON array of strings, where each string is a suggested image prompt. Example output format: ["prompt idea 1", "prompt idea 2", "a third idea"]
 
-Article Text:
----
-{article}
----
+        Article Text:
+        ---
+        {article}
+        ---
 
-Suggested Prompts (JSON Array Only):"#,
+        Suggested Prompts (JSON Array Only):"#,
         article = request.article_text
     );
 
@@ -706,6 +752,104 @@ Suggested Prompts (JSON Array Only):"#,
     }
 }
 
+#[tauri::command]
+async fn publish_to_wordpress(
+    app: tauri::AppHandle,
+    request: PublishRequest,
+) -> Result<String, String> {
+    println!(
+        "Rust: Received request to publish article for project: {}",
+        request.project_name
+    );
+
+    let settings = get_project_settings(app.clone(), request.project_name.clone())
+        .await?
+        .ok_or_else(|| format!("Settings not found for project '{}'", request.project_name))?;
+
+    if settings.wordpress_url.trim().is_empty() {
+        return Err("WordPress URL is not configured in project settings.".to_string());
+    }
+    if settings.wordpress_user.trim().is_empty() {
+        return Err("WordPress User is not configured in project settings.".to_string());
+    }
+    if settings.wordpress_pass.trim().is_empty() {
+        return Err("WordPress Application Password is not configured.".to_string());
+    }
+
+    let title_regex = Regex::new(r"(?i)<title>(.*?)</title>")
+        .map_err(|e| format!("Failed to compile title regex: {}", e))?;
+    let default_title = format!("Generated Article for {}", settings.tool_name);
+    let post_title = title_regex
+        .captures(&request.article_html)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&default_title);
+
+    println!("Rust: Using post title: '{}'", post_title);
+
+    let api_url = format!(
+        "{}/wp-json/wp/v2/posts",
+        settings.wordpress_url.trim_end_matches('/')
+    );
+    println!("Rust: Posting to WordPress API URL: {}", api_url);
+
+    let publish_status = request
+        .publish_status
+        .as_deref()
+        .filter(|s| ["publish", "draft", "pending"].contains(s))
+        .unwrap_or("publish");
+
+    println!("Rust: Using publish status: '{}'", publish_status);
+
+    let post_payload = WordPressPostPayload {
+        title: post_title,
+        content: &request.article_html,
+        status: publish_status,
+    };
+
+    let client = Client::new();
+    println!(
+        "Rust: Authenticating with WP User: {}",
+        settings.wordpress_user
+    );
+    let response = client
+        .post(&api_url)
+        .basic_auth(&settings.wordpress_user, Some(&settings.wordpress_pass))
+        .json(&post_payload)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to WordPress API: {}", e))?;
+
+    let status = response.status();
+    println!(
+        "Rust: Received response from WordPress API (Status: {})",
+        status
+    );
+
+    if status.is_success() {
+        let response_text = response.text().await.unwrap_or_default();
+        println!("Rust: WordPress API Success Response: {}", response_text);
+        Ok(format!(
+            "Article successfully published to WordPress with status '{}'!",
+            publish_status
+        ))
+    } else {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Could not read WordPress error body".to_string());
+        println!(
+            "Rust: WordPress API request failed - Status: {}, Body: {}",
+            status, error_text
+        );
+        Err(format!(
+            "WordPress API request failed with status {}: {}",
+            status, error_text
+        ))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -754,8 +898,22 @@ pub fn run() {
             delete_project,
             generate_ideogram_image,
             generate_full_article,
-            suggest_image_prompts
+            suggest_image_prompts,
+            publish_to_wordpress
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn default_string() -> String {
+    String::new()
+}
+fn default_sections() -> Vec<SectionDefinitionData> {
+    Vec::new()
+}
+fn default_text_model() -> String {
+    "gpt-4o".to_string()
+}
+fn default_word_count() -> u32 {
+    1000
 }

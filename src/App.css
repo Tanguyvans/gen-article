@@ -245,3 +245,17 @@ button.delete-button:hover {
     font-size: 0.95em;
     line-height: 1.5;
 }
+
+.image-prompt-section label {
+  min-width: auto;
+  text-align: left;
+  margin-right: 0;
+}
+
+.image-prompt-section .row {
+    align-items: flex-end;
+}
+
+.image-result-area img {
+    display: block;
+}
