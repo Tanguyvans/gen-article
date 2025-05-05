@@ -166,6 +166,7 @@ struct PublishRequest {
     project_name: String,
     article_html: String,
     publish_status: Option<String>,
+    category_id: Option<u32>,
 }
 
 #[derive(Serialize, Debug)]
@@ -173,6 +174,15 @@ struct WordPressPostPayload<'a> {
     title: &'a str,
     content: &'a str,
     status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    categories: Option<Vec<u32>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct WordPressCategory {
+    id: u32,
+    name: String,
+    slug: String,
 }
 
 #[tauri::command]
@@ -753,6 +763,72 @@ async fn suggest_image_prompts(
 }
 
 #[tauri::command]
+async fn get_wordpress_categories(
+    app: tauri::AppHandle,
+    project_name: String,
+) -> Result<Vec<WordPressCategory>, String> {
+    println!("Rust: Fetching WP categories for project: {}", project_name);
+
+    let settings = get_project_settings(app.clone(), project_name.clone())
+        .await?
+        .ok_or_else(|| format!("Settings not found for project '{}'", project_name))?;
+
+    if settings.wordpress_url.trim().is_empty()
+        || settings.wordpress_user.trim().is_empty()
+        || settings.wordpress_pass.trim().is_empty()
+    {
+        return Err(
+            "WordPress URL, User, and Application Password must be configured.".to_string(),
+        );
+    }
+
+    let categories_api_url = format!(
+        "{}/wp-json/wp/v2/categories?per_page=100",
+        settings.wordpress_url.trim_end_matches('/')
+    );
+    println!("Rust: Fetching categories from URL: {}", categories_api_url);
+
+    let client = Client::new();
+    let response = client
+        .get(&categories_api_url)
+        .basic_auth(&settings.wordpress_user, Some(&settings.wordpress_pass))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to WordPress Categories API: {}", e))?;
+
+    let status = response.status();
+    println!(
+        "Rust: Received category response from WP (Status: {})",
+        status
+    );
+
+    if status.is_success() {
+        let categories = response
+            .json::<Vec<WordPressCategory>>()
+            .await
+            .map_err(|e| format!("Failed to parse WordPress categories JSON: {}", e))?;
+        println!(
+            "Rust: Successfully fetched {} categories.",
+            categories.len()
+        );
+        Ok(categories)
+    } else {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Could not read WordPress error body".to_string());
+        println!(
+            "Rust: Failed to fetch categories - Status: {}, Body: {}",
+            status, error_text
+        );
+        Err(format!(
+            "Failed to fetch categories (Status {}): {}",
+            status, error_text
+        ))
+    }
+}
+
+#[tauri::command]
 async fn publish_to_wordpress(
     app: tauri::AppHandle,
     request: PublishRequest,
@@ -761,6 +837,9 @@ async fn publish_to_wordpress(
         "Rust: Received request to publish article for project: {}",
         request.project_name
     );
+    if let Some(cat_id) = request.category_id {
+        println!("Rust: Requested category ID: {}", cat_id);
+    }
 
     let settings = get_project_settings(app.clone(), request.project_name.clone())
         .await?
@@ -806,6 +885,7 @@ async fn publish_to_wordpress(
         title: post_title,
         content: &request.article_html,
         status: publish_status,
+        categories: request.category_id.map(|id| vec![id]),
     };
 
     let client = Client::new();
@@ -830,9 +910,12 @@ async fn publish_to_wordpress(
     if status.is_success() {
         let response_text = response.text().await.unwrap_or_default();
         println!("Rust: WordPress API Success Response: {}", response_text);
+        let category_msg = request
+            .category_id
+            .map_or("".to_string(), |id| format!(" in category ID {}", id));
         Ok(format!(
-            "Article successfully published to WordPress with status '{}'!",
-            publish_status
+            "Article successfully published to WordPress with status '{}'{}!",
+            publish_status, category_msg
         ))
     } else {
         let error_text = response
@@ -899,7 +982,8 @@ pub fn run() {
             generate_ideogram_image,
             generate_full_article,
             suggest_image_prompts,
-            publish_to_wordpress
+            publish_to_wordpress,
+            get_wordpress_categories
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

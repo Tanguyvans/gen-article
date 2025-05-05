@@ -74,6 +74,13 @@ type AspectRatio = typeof ideogramAspectRatios[number];
 const textGenerationModels = ["gpt-4o", "gpt-4-turbo", "gpt-4.1", "gpt-3.5-turbo"] as const; // Example models
 type TextModel = typeof textGenerationModels[number];
 
+// --- NEW Interface for WP Category ---
+interface WordPressCategory {
+    id: number; // Use number for ID
+    name: string;
+    slug: string;
+}
+
 interface ProjectPageProps {
   projectName: string;
   displayFeedback: DisplayFeedback;
@@ -122,9 +129,42 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   // --- NEW State for publishing
   const [isPublishing, setIsPublishing] = useState(false);
 
+  // --- NEW WP Category State ---
+  const [wpCategories, setWpCategories] = useState<WordPressCategory[]>([]);
+  const [isLoadingWpCategories, setIsLoadingWpCategories] = useState(false);
+  const [selectedWpCategoryId, setSelectedWpCategoryId] = useState<string>(''); // Store ID as string for select value
+
   // --- ADD LOGGING INSIDE RENDER ---
   console.log("[ProjectPage Render] generatedArticle state:", generatedArticle ? generatedArticle.substring(0, 100) + "..." : generatedArticle);
   // --- END LOGGING ---
+
+  const fetchWpCategories = useCallback(async () => {
+    if (!currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass) {
+        // Don't try if credentials aren't set
+        setWpCategories([]); // Clear categories if WP settings are invalid/missing
+        setSelectedWpCategoryId('');
+        return;
+    }
+    setIsLoadingWpCategories(true);
+    setSelectedWpCategoryId(''); // Reset selection
+    try {
+        const categories = await invoke<WordPressCategory[]>("get_wordpress_categories", { projectName });
+        setWpCategories(categories || []); // Handle potential null/undefined response
+        if (categories && categories.length > 0) {
+            // Optionally set a default, e.g., the first category, or leave it blank
+            // setSelectedWpCategoryId(String(categories[0].id));
+        } else {
+            displayFeedback("No categories found for the configured WordPress site.", "warning");
+        }
+    } catch (err) {
+        console.error("Failed to fetch WP categories:", err);
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        displayFeedback(`Error fetching WP categories: ${errorMsg}`, "error");
+        setWpCategories([]); // Clear on error
+    } finally {
+        setIsLoadingWpCategories(false);
+    }
+  }, [projectName, currentSettings?.wordpress_url, currentSettings?.wordpress_user, currentSettings?.wordpress_pass, displayFeedback]); // Depend on WP creds
 
   const fetchProjectSettings = useCallback(async (name: string) => {
         setIsLoadingSettings(true);
@@ -142,6 +182,9 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         setIsGeneratingImage({});
         setPromptAspectRatios({}); // Reset aspect ratios
         setTestImageAspectRatio("16x9"); // Reset test aspect ratio
+        setWpCategories([]); // Clear categories on project load
+        setSelectedWpCategoryId('');
+        setIsLoadingWpCategories(false); // Reset loading state
         // --- END Reset ---
         try {
             const settings = await invoke<ProjectSettings | null>(
@@ -167,6 +210,12 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                     setSectionDefinitions([
                         { id: getNewSectionId(), instructions: "Write an engaging introduction for [Tool Name]..." }
                     ]);
+                }
+
+                // --- Trigger category fetch AFTER settings are loaded and valid ---
+                if (settings.wordpress_url && settings.wordpress_user && settings.wordpress_pass) {
+                    // Use setTimeout to allow state update before fetching
+                    setTimeout(() => fetchWpCategories(), 0);
                 }
 
             } else {
@@ -197,7 +246,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         } finally {
             setIsLoadingSettings(false);
         }
-    }, [projectName, displayFeedback, onBack]);
+    }, [projectName, displayFeedback, onBack, fetchWpCategories]);
 
   useEffect(() => {
     nextSectionId = 1;
@@ -574,11 +623,16 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
        displayFeedback("Publishing article to WordPress...", "warning");
 
        try {
-           const requestPayload: { project_name: string; article_html: string; publish_status?: string } = {
+           // Parse category ID back to number, or null if empty/invalid
+          const categoryIdNum = selectedWpCategoryId ? parseInt(selectedWpCategoryId, 10) : null;
+
+           const requestPayload: { project_name: string; article_html: string; publish_status?: string; category_id?: number | null } = {
                 project_name: projectName,
                 article_html: generatedArticle,
-                publish_status: "publish" // Or "draft", or make this configurable later
+                publish_status: "publish",
+                category_id: (categoryIdNum && !isNaN(categoryIdNum)) ? categoryIdNum : null // Send number or null
            };
+           console.log("Sending publish payload:", requestPayload); // Log payload
            const successMessage = await invoke<string>("publish_to_wordpress", { request: requestPayload });
            displayFeedback(successMessage, "success");
        } catch (err) {
@@ -589,6 +643,18 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
            setIsPublishing(false);
        }
   };
+
+  // --- Update useEffect to re-fetch categories if WP settings change in the currentSettings state ---
+   useEffect(() => {
+     // Fetch categories whenever the relevant settings change
+     if (!isLoadingSettings && currentSettings?.wordpress_url && currentSettings?.wordpress_user && currentSettings?.wordpress_pass) {
+        fetchWpCategories();
+     } else {
+        // Clear categories if WP settings become invalid
+        setWpCategories([]);
+        setSelectedWpCategoryId('');
+     }
+   }, [currentSettings?.wordpress_url, currentSettings?.wordpress_user, currentSettings?.wordpress_pass, isLoadingSettings, fetchWpCategories]);
 
   return (
     <div className="page-container">
@@ -734,23 +800,50 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                         placeholder="Article will appear here after generation..." // Added placeholder
                         style={{ width: '100%', minHeight: '400px', whiteSpace: 'pre-wrap', wordWrap: 'break-word', background: '#f9f9f9', padding: '15px', borderRadius: '4px', border: '1px solid #ccc', boxSizing: 'border-box', fontFamily: 'monospace' }}
                      />
+
+                     {/* --- Category Selector --- */}
+                     <div className="row" style={{ marginTop: '15px', marginBottom: '10px', alignItems: 'center' }}>
+                        <label htmlFor="wpCategory" style={{ marginRight: '10px', minWidth: '120px' }}>WP Category:</label>
+                        <select
+                            id="wpCategory"
+                            value={selectedWpCategoryId}
+                            onChange={(e) => setSelectedWpCategoryId(e.target.value)}
+                            disabled={isLoadingWpCategories || isPublishing || wpCategories.length === 0}
+                            style={{ flexGrow: 1 }}
+                        >
+                            <option value="">-- Select Category (Optional) --</option>
+                            {isLoadingWpCategories && <option value="" disabled>Loading categories...</option>}
+                            {wpCategories.map(cat => (
+                                <option key={cat.id} value={String(cat.id)}>{cat.name}</option>
+                            ))}
+                        </select>
+                        <button
+                            type="button"
+                            onClick={fetchWpCategories}
+                            disabled={isLoadingWpCategories || isPublishing || !currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass}
+                            style={{ marginLeft: '10px', padding: '0.4em 0.8em' }}
+                            title="Refresh Category List"
+                        >
+                             &#x21bb; {/* Refresh Symbol */}
+                         </button>
+                     </div>
+
                      {/* Button Group for Generated Article */}
-                     <div style={{ marginTop: '15px', display: 'flex', gap: '10px' }}>
-                         {/* Button to Suggest Prompts */}
+                     <div style={{ marginTop: '5px', display: 'flex', gap: '10px' }}>
+                         {/* Suggest Prompts Button */}
                          <button
                             type="button"
                             onClick={handleSuggestImagePrompts}
-                            disabled={isGenerating || isSuggestingPrompts || isPublishing || !generatedArticle} // Disable while publishing
-                            // style={{ }} // Keep existing styles if any
+                            disabled={isGenerating || isSuggestingPrompts || isPublishing || !generatedArticle}
                         >
                             {isSuggestingPrompts ? 'Suggesting...' : 'Suggest Image Prompts'}
                         </button>
 
-                        {/* --- NEW Publish Button --- */}
-                        <button
+                         {/* Publish Button */}
+                         <button
                             type="button"
                             onClick={handlePublishToWordPress}
-                            disabled={isGenerating || isSuggestingPrompts || isPublishing || !generatedArticle || !currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass}
+                            disabled={isGenerating || isSuggestingPrompts || isPublishing || isLoadingWpCategories || !generatedArticle || !currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass}
                             title={(!currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass) ? "Configure WP settings first" : "Publish to WordPress"}
                         >
                             {isPublishing ? 'Publishing...' : 'Publish to WordPress'}
