@@ -144,12 +144,13 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   // --- NEW Image Prompt Suggestion State ---
   const [isSuggestingPrompts, setIsSuggestingPrompts] = useState(false);
   const [suggestedPrompts, setSuggestedPrompts] = useState<string[] | null>(null);
-  const [editedPrompts, setEditedPrompts] = useState<Record<number, string>>({}); // Store edits, keyed by index
+  const [editedPrompts, setEditedPrompts] = useState<Record<number, string>>({});
+  const [promptAspectRatios, setPromptAspectRatios] = useState<Record<number, AspectRatio>>({});
+  const [promptAltTexts, setPromptAltTexts] = useState<Record<number, string>>({});
 
   // --- NEW Image Generation State (per prompt) ---
   const [imageGenResults, setImageGenResults] = useState<ImageGenResults>({});
   const [isGeneratingImage, setIsGeneratingImage] = useState<Record<number, boolean>>({}); // Track loading per prompt
-  const [promptAspectRatios, setPromptAspectRatios] = useState<Record<number, AspectRatio>>({}); // Store aspect ratio per prompt
 
   // --- NEW Article Config State ---
   const [textModelInput, setTextModelInput] = useState<TextModel>(DEFAULT_TEXT_MODEL);
@@ -172,6 +173,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   console.log("[ProjectPage Render] generatedArticle state:", generatedArticle ? generatedArticle.substring(0, 100) + "..." : generatedArticle);
   console.log("[ProjectPage Render] selectedImageIndices:", selectedImageIndices);
   console.log("[ProjectPage Render] isInsertingPlaceholders:", isInsertingPlaceholders);
+  console.log("[ProjectPage Render] promptAltTexts:", promptAltTexts);
   // --- END LOGGING ---
 
   const fetchWpCategories = useCallback(async () => {
@@ -502,27 +504,35 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
     setIsGeneratingImage({});
     setPromptAspectRatios({}); // Reset aspect ratios
     setSelectedImageIndices(new Set()); // Clear selection when suggesting new prompts
+    setPromptAltTexts({}); // Clear previous alt texts
     displayFeedback("Suggesting image prompts...", "warning");
 
     try {
         const request: SuggestImagePromptsRequest = { article_text: generatedArticle };
         const response = await invoke<SuggestImagePromptsResponse>("suggest_image_prompts", { request });
         setSuggestedPrompts(response.prompts);
-        // Initialize edited prompts state and aspect ratios
+
         const initialEdits: Record<number, string> = {};
         const initialRatios: Record<number, AspectRatio> = {};
+        const initialAltTexts: Record<number, string> = {}; // For new alt texts
+
         response.prompts.forEach((prompt, index) => {
-            initialEdits[index] = prompt; // Start with suggested prompt
-            initialRatios[index] = "16x9"; // Default aspect ratio
+            initialEdits[index] = prompt;
+            initialRatios[index] = "16x9";
+            // Default alt text to the prompt itself, user can edit
+            initialAltTexts[index] = prompt.substring(0, 100); // Or a snippet, or empty
         });
         setEditedPrompts(initialEdits);
-        setPromptAspectRatios(initialRatios); // Set initial aspect ratios
+        setPromptAspectRatios(initialRatios);
+        setPromptAltTexts(initialAltTexts); // Initialize alt texts
+
         displayFeedback("Image prompts suggested.", "success");
     } catch (err) {
         console.error("Failed to suggest image prompts:", err);
         const errorMsg = err instanceof Error ? err.message : String(err);
         displayFeedback(`Error suggesting prompts: ${errorMsg}`, "error");
-        setSuggestedPrompts([]); // Set to empty array on error?
+        setSuggestedPrompts([]);
+        setPromptAltTexts({});
     } finally {
         setIsSuggestingPrompts(false);
     }
@@ -550,6 +560,13 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         }
   };
 
+  // --- NEW Handler for Alt Text Changes ---
+  const handlePromptAltTextChange = (index: number, value: string) => {
+      setPromptAltTexts(prev => ({
+          ...prev,
+          [index]: value
+      }));
+  };
 
   // --- NEW Handler for Generating Image for a SPECIFIC Prompt ---
   const handleGenerateSpecificImage = async (index: number) => {
@@ -766,12 +783,17 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                 const imagesForLLM: ImageDetailsForLLM[] = successfulUploads.map((result, idx) => {
                      const uploadedItem = imagesToUpload.find(item => item.url === result.original_url);
                      const originalIndex = uploadedItem ? uploadedItem.originalIndex : -1;
-                     const altText = originalIndex !== -1 ? (editedPrompts[originalIndex] || `Image ${originalIndex + 1} for ${projectName}`) : `Uploaded image for ${projectName}`;
+
+                    // Use custom alt text if available, otherwise fall back to edited prompt, then generic
+                    let altText = `Image for ${projectName}`; // Generic fallback
+                    if (originalIndex !== -1) {
+                        altText = promptAltTexts[originalIndex] || editedPrompts[originalIndex] || `Image ${originalIndex + 1} for ${projectName}`;
+                    }
 
                     return {
                         wordpress_media_url: result.wordpress_media_url!,
                         wordpress_media_id: result.wordpress_media_id!,
-                        alt_text: altText.replace(/"/g, '&quot;'),
+                        alt_text: altText.replace(/"/g, '&quot;'), // Escape quotes
                         placeholder_index: idx + 1 // Assign sequential index (1, 2, 3...) for placeholders
                     };
                 });
@@ -1059,7 +1081,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                 {suggestedPrompts.map((_, index) => (
                     <div key={`prompt-${index}`} className="image-prompt-section" style={{ marginBottom: '25px', paddingBottom: '25px', borderBottom: '1px solid #eee' }}>
                         <label htmlFor={`prompt-input-${index}`} style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold' }}>Prompt {index + 1}:</label>
-                        {/* Textarea for the prompt */}
                         <textarea
                             id={`prompt-input-${index}`}
                             value={editedPrompts[index] || ''}
@@ -1067,12 +1088,28 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                             rows={3}
                             placeholder={`Edit suggested prompt ${index + 1}...`}
                             disabled={anyLoading}
-                            style={{ width: '100%', minHeight: '60px', marginBottom: '10px', boxSizing: 'border-box' }} // Ensure full width and add margin
+                            style={{ width: '100%', minHeight: '60px', marginBottom: '10px', boxSizing: 'border-box' }}
                         />
+
+                        {/* --- NEW Alt Text Input --- */}
+                        <div className="row" style={{ marginBottom: '10px' }}>
+                            <label htmlFor={`prompt-alt-text-${index}`} style={{ minWidth: '100px' }}>Alt Text:</label>
+                            <input
+                                type="text"
+                                id={`prompt-alt-text-${index}`}
+                                value={promptAltTexts[index] || ''}
+                                onChange={(e) => handlePromptAltTextChange(index, e.target.value)}
+                                placeholder="Describe the image for accessibility/SEO"
+                                disabled={anyLoading}
+                                style={{ flexGrow: 1 }}
+                            />
+                        </div>
+                        {/* --- End NEW Alt Text Input --- */}
+
                         {/* --- Controls Row (Dropdown + Button) --- */}
                         <div className="row" style={{ marginBottom: '15px', gap: '15px' }}>
                             {/* Aspect Ratio Selector */}
-                            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1 }}> {/* Allow grow */}
+                            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1 }}>
                                 <label htmlFor={`prompt-aspect-${index}`} style={{ marginBottom: '3px', textAlign: 'left', minWidth: 'auto' }}>Aspect Ratio:</label>
                                 <select
                                     id={`prompt-aspect-${index}`}
@@ -1086,13 +1123,13 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                                 </select>
                             </div>
                             {/* Generate Button */}
-                            <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}> {/* Align button */}
+                            <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
                                 <button
                                     type="button"
                                     onClick={() => handleGenerateSpecificImage(index)}
                                     disabled={anyLoading || !editedPrompts[index]?.trim()}
                                 >
-                                    {anyLoading ? 'Generating...' : 'Generate Image'}
+                                    {isGeneratingImage[index] ? 'Generating...' : 'Generate Image'}
                                 </button>
                             </div>
                         </div>
@@ -1104,20 +1141,19 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                                  {imageGenResults[index].image_url && (
                                      <div>
                                         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '5px' }}>
-                                            {/* --- NEW Checkbox for Selection --- */}
                                             <input
                                                 type="checkbox"
                                                 id={`select-image-${index}`}
                                                 checked={selectedImageIndices.has(index)}
                                                 onChange={() => handleImageSelectionChange(index)}
                                                 disabled={anyLoading}
-                                                style={{ transform: 'scale(1.2)' }} // Make checkbox slightly larger
+                                                style={{ transform: 'scale(1.2)' }}
                                             />
                                             <label htmlFor={`select-image-${index}`} style={{ fontWeight: '500', cursor: 'pointer' }}>Select this Image</label>
                                         </div>
                                          <img
                                             src={imageGenResults[index].image_url!}
-                                            alt={`Generated image for prompt ${index + 1}`}
+                                            alt={promptAltTexts[index] || `Generated image for prompt ${index + 1}`}
                                             style={{ maxWidth: '100%', maxHeight: '350px', height: 'auto', marginTop: '5px', border: '1px solid #ddd', borderRadius: '4px' }}
                                           />
                                      </div>
