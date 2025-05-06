@@ -14,7 +14,7 @@ import ProjectPage from './pages/ProjectPage';
 // --- Types ---
 export type View = "home" | "settings"; // Export View type if needed by children
 // Updated type definition to include 'warning'
-export type FeedbackType = "success" | "error" | "warning";
+export type FeedbackType = "success" | "error" | "warning" | "info";
 export type DisplayFeedback = (message: string, type: FeedbackType) => void; // Export helper type
 
 // --- Main App Component ---

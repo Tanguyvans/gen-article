@@ -42,6 +42,11 @@ interface ImageGenResponse {
     error: string | null;
 }
 
+// --- NEW Interface to hold comprehensive image state including WP details ---
+interface ImageState extends ImageGenResponse {
+    wordpress_media_id?: number;
+    wordpress_media_url?: string;
+}
 
 // --- Updated Request Interface ---
 interface FullArticleRequest {
@@ -64,7 +69,7 @@ interface SuggestImagePromptsRequest {
 }
 
 // --- NEW Type for storing image generation results per prompt ---
-type ImageGenResults = Record<number, ImageGenResponse>; // Keyed by prompt index
+type ImageGenResults = Record<number, ImageState>; // Keyed by prompt index
 
 // --- Define possible aspect ratios ---
 const ideogramAspectRatios = ["1x1", "16x9", "9x16", "4x3", "3x4", "10x16", "16x10", "1x3", "3x1", "1x2", "2x1", "2x3", "3x2", "4x5", "5x4"] as const;
@@ -132,10 +137,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   const [isGenerating, setIsGenerating] = useState(false);
   const [toolNameInput, setToolNameInput] = useState("");
   const [sectionDefinitions, setSectionDefinitions] = useState<SectionDefinition[]>([]);
-  const [testImagePrompt, setTestImagePrompt] = useState("");
-  const [testImageResult, setTestImageResult] = useState<ImageGenResponse | null>(null);
-  const [isTestingImage, setIsTestingImage] = useState(false);
-  const [testImageAspectRatio, setTestImageAspectRatio] = useState<AspectRatio>("16x9"); // Default aspect ratio for test
 
   // State specifically for the inputs managed in the base settings form
   const [articleGoalPromptInput, setArticleGoalPromptInput] = useState("");
@@ -168,41 +169,67 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   const [selectedImageIndices, setSelectedImageIndices] = useState<Set<number>>(new Set());
   const [isUploadingImages, setIsUploadingImages] = useState(false);
   const [isInsertingPlaceholders, setIsInsertingPlaceholders] = useState(false);
+  const [selectedFeaturedMediaId, setSelectedFeaturedMediaId] = useState<number | null>(null); // NEW state for featured image
 
   // --- ADD LOGGING INSIDE RENDER ---
   console.log("[ProjectPage Render] generatedArticle state:", generatedArticle ? generatedArticle.substring(0, 100) + "..." : generatedArticle);
   console.log("[ProjectPage Render] selectedImageIndices:", selectedImageIndices);
   console.log("[ProjectPage Render] isInsertingPlaceholders:", isInsertingPlaceholders);
   console.log("[ProjectPage Render] promptAltTexts:", promptAltTexts);
+  console.log("[ProjectPage Render] selectedFeaturedMediaId:", selectedFeaturedMediaId);
   // --- END LOGGING ---
 
   const fetchWpCategories = useCallback(async () => {
     if (!currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass) {
-        // Don't try if credentials aren't set
-        setWpCategories([]); // Clear categories if WP settings are invalid/missing
+        setWpCategories([]);
         setSelectedWpCategoryId('');
         return;
     }
     setIsLoadingWpCategories(true);
-    setSelectedWpCategoryId(''); // Reset selection
+    // We will check and potentially reset selectedWpCategoryId *after* the fetch attempt.
+
     try {
         const categories = await invoke<WordPressCategory[]>("get_wordpress_categories", { projectName });
-        setWpCategories(categories || []); // Handle potential null/undefined response
+        setWpCategories(categories || []);
+
         if (categories && categories.length > 0) {
-            // Optionally set a default, e.g., the first category, or leave it blank
-            // setSelectedWpCategoryId(String(categories[0].id));
+            const currentSelectionStillValid = categories.some(cat => String(cat.id) === selectedWpCategoryId);
+            if (!currentSelectionStillValid) {
+                // If the previously selected category ID is no longer in the fetched list, clear it.
+                setSelectedWpCategoryId('');
+            }
+            // If currentSelectionStillValid is true, selectedWpCategoryId remains as is.
         } else {
+            // No categories found or an empty list was returned
             displayFeedback("No categories found for the configured WordPress site.", "warning");
+            setSelectedWpCategoryId(''); // Clear selection as there are no categories
+            setWpCategories([]); // Ensure categories state is also empty
         }
     } catch (err) {
-        console.error("Failed to fetch WP categories:", err);
         const errorMsg = err instanceof Error ? err.message : String(err);
-        displayFeedback(`Error fetching WP categories: ${errorMsg}`, "error");
-        setWpCategories([]); // Clear on error
+        if (errorMsg.includes("Status 429 Too Many Requests") && wpCategories.length === 0 && !selectedWpCategoryId) {
+            // Suppress feedback only for true initial load 429 errors where no categories or selection existed.
+            console.error("Initial WP category fetch failed with 429 (feedback suppressed): ", errorMsg);
+        } else {
+            console.error("Failed to fetch WP categories:", err);
+        }
+        // On any error during fetch, clear both categories and selection to be safe.
+        setWpCategories([]);
+        setSelectedWpCategoryId('');
     } finally {
         setIsLoadingWpCategories(false);
     }
-  }, [projectName, currentSettings?.wordpress_url, currentSettings?.wordpress_user, currentSettings?.wordpress_pass, displayFeedback]); // Depend on WP creds
+  }, [
+        projectName,
+        currentSettings?.wordpress_url,
+        currentSettings?.wordpress_user,
+        currentSettings?.wordpress_pass,
+        displayFeedback,
+        // Only include selectedWpCategoryId here, not wpCategories.length,
+        // to avoid re-fetching if only wpCategories.length changes due to an error clear.
+        // The logic now handles re-validation of selectedWpCategoryId internally.
+        selectedWpCategoryId
+  ]);
 
   const fetchProjectSettings = useCallback(async (name: string) => {
         setIsLoadingSettings(true);
@@ -221,7 +248,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         setPromptAspectRatios({}); // Reset aspect ratios
         setSelectedImageIndices(new Set()); // Reset selected images
         setIsUploadingImages(false); // Reset upload state
-        setTestImageAspectRatio("16x9"); // Reset test aspect ratio
         setWpCategories([]); // Clear categories on project load
         setSelectedWpCategoryId('');
         setIsLoadingWpCategories(false); // Reset loading state
@@ -505,6 +531,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
     setPromptAspectRatios({}); // Reset aspect ratios
     setSelectedImageIndices(new Set()); // Clear selection when suggesting new prompts
     setPromptAltTexts({}); // Clear previous alt texts
+    setSelectedFeaturedMediaId(null); // Reset featured image selection
     displayFeedback("Suggesting image prompts...", "warning");
 
     try {
@@ -618,57 +645,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
       }
   };
 
-  // --- New Test Image Generation Handler ---
-  const handleTestImageGenerate = async () => {
-       if (!testImagePrompt.trim()) {
-          displayFeedback("Please enter a prompt for the test image.", "error");
-          return;
-      }
-      setIsTestingImage(true);
-      setTestImageResult(null);
-      displayFeedback(`Requesting test image (${testImageAspectRatio}) for: "${testImagePrompt}"...`, "success");
-
-      try {
-          // Prepare request payload including aspect ratio
-          const testImageRequestPayload: ImageGenRequest = {
-              prompt: testImagePrompt,
-              aspect_ratio: testImageAspectRatio,
-              // rendering_speed could be added here if needed
-          };
-          const response = await invoke<ImageGenResponse>("generate_ideogram_image", {
-              request: testImageRequestPayload // Send updated payload
-          });
-          setTestImageResult(response); // Store the full response object
-
-          if(response.error) {
-              displayFeedback(`Test image generation failed: ${response.error}`, "error");
-          } else if (response.image_url) {
-              displayFeedback(`Test image generated successfully!`, "success");
-              // Image URL is now in testImageResult.image_url
-          } else {
-              displayFeedback(`Test image generation completed but no URL returned.`, "warning");
-          }
-
-      } catch(err) {
-          console.error("Test image generation invoke failed:", err);
-          displayFeedback(`Test image generation failed: ${err}`, "error");
-          setTestImageResult({ image_url: null, error: String(err) });
-      } finally {
-          setIsTestingImage(false);
-      }
-  };
-
-  // --- Handler for Test Image Aspect Ratio Change ---
-  const handleTestAspectRatioChange = (e: ChangeEvent<HTMLSelectElement>) => {
-        const value = e.target.value;
-        const isValidRatio = (r: string): r is AspectRatio => ideogramAspectRatios.includes(r as AspectRatio);
-        if (isValidRatio(value)) {
-            setTestImageAspectRatio(value);
-        } else {
-             console.warn(`Invalid aspect ratio selected for test: ${value}`);
-        }
-  };
-
   // --- NEW WordPress Publishing Handler ---
   const handlePublishToWordPress = async () => {
       if (!generatedArticle) {
@@ -684,16 +660,29 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
        displayFeedback("Publishing article to WordPress...", "warning");
 
        try {
-           // Parse category ID back to number, or null if empty/invalid
-          const categoryIdNum = selectedWpCategoryId ? parseInt(selectedWpCategoryId, 10) : null;
+           const categoryIdNum = selectedWpCategoryId ? parseInt(selectedWpCategoryId, 10) : null;
 
-           const requestPayload: { project_name: string; article_html: string; publish_status?: string; category_id?: number | null } = {
-                project_name: projectName,
-                article_html: generatedArticle,
-                publish_status: "publish",
-                category_id: (categoryIdNum && !isNaN(categoryIdNum)) ? categoryIdNum : null // Send number or null
+            // --- ADD LOGGING HERE ---
+            console.log("[handlePublishToWordPress] Selected Featured Media ID being sent:", selectedFeaturedMediaId);
+            // --- END LOGGING ---
+
+           // --- MODIFIED PAYLOAD to include featured_media ---
+           const requestPayload: {
+               project_name: string;
+               article_html: string;
+               publish_status?: string;
+               category_id?: number | null;
+               featured_media_id?: number | null; // Added
+           } = {
+               project_name: projectName,
+               article_html: generatedArticle,
+               publish_status: "publish", // or "draft"
+               category_id: (categoryIdNum && !isNaN(categoryIdNum)) ? categoryIdNum : null,
+               featured_media_id: selectedFeaturedMediaId // Pass the selected media ID
            };
-           console.log("Sending publish payload:", requestPayload); // Log payload
+           // --- END MODIFICATION ---
+
+           console.log("Sending publish payload:", requestPayload);
            const successMessage = await invoke<string>("publish_to_wordpress", { request: requestPayload });
            displayFeedback(successMessage, "success");
        } catch (err) {
@@ -711,14 +700,35 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
           const newSet = new Set(prev);
           if (newSet.has(index)) {
               newSet.delete(index);
+              // If unselecting an image that was the featured image, clear it
+              if (imageGenResults[index]?.wordpress_media_id === selectedFeaturedMediaId) {
+                  setSelectedFeaturedMediaId(null);
+              }
           } else {
-              // Only allow selecting if the image exists and was generated successfully
               if (imageGenResults[index]?.image_url) {
                  newSet.add(index);
               }
           }
           return newSet;
       });
+  };
+
+  // --- NEW Handler for Featured Image Selection ---
+  const handleSetFeaturedImage = (index: number) => {
+      const result = imageGenResults[index];
+      // Only allow setting as featured if it's a successfully uploaded image
+      // and it's one of the selected images for upload/insertion
+      if (result?.wordpress_media_id && selectedImageIndices.has(index)) {
+          setSelectedFeaturedMediaId(result.wordpress_media_id);
+      } else if (result?.wordpress_media_id && !selectedImageIndices.has(index)) {
+          // If user tries to set an unselected image as featured, auto-select it.
+          setSelectedImageIndices(prev => new Set(prev).add(index));
+          setSelectedFeaturedMediaId(result.wordpress_media_id);
+          displayFeedback("Image auto-selected as it was chosen for featured image.", "info");
+      } else {
+          // This case should ideally not happen if UI is disabled correctly
+          displayFeedback("Cannot set as featured: Image not yet uploaded or selected.", "warning");
+      }
   };
 
   // --- Modified Upload/Insert Handler ---
@@ -744,11 +754,10 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
 
       setIsUploadingImages(true); // Start upload phase
       setIsInsertingPlaceholders(false); // Ensure placeholder phase isn't active yet
-      const initialArticleContent = generatedArticle || ""; // Store initial content
       displayFeedback(`Uploading ${imagesToUpload.length} selected image(s) to WordPress...`, "warning");
 
       let uploadResponse: UploadImagesResponse | null = null;
-      let successfulUploads: ImageUploadResult[] = []; // Store successful uploads
+      let successfulUploadsWithDetails: (ImageUploadResult & { originalIndex: number })[] = [];
 
       try {
           // --- Step 1: Upload Images ---
@@ -760,9 +769,39 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
           uploadResponse = await invoke<UploadImagesResponse>("upload_images_to_wordpress", { request: uploadRequestPayload });
           console.log("Image upload response:", uploadResponse);
 
-          successfulUploads = uploadResponse.results.filter(r => r.success && r.wordpress_media_url && r.wordpress_media_id);
+          // Process upload results and update imageGenResults state with WP details
+          const newImageGenResults = { ...imageGenResults };
+          successfulUploadsWithDetails = uploadResponse.results
+              .map(uploadResult => {
+                  const correspondingSelectedItem = imagesToUpload.find(item => item.url === uploadResult.original_url);
+                  const originalIndex = correspondingSelectedItem ? correspondingSelectedItem.originalIndex : -1;
+
+                  if (uploadResult.success && uploadResult.wordpress_media_id && originalIndex !== -1) {
+                      // Update the specific imageGenResult with wordpress_media_id and wordpress_media_url
+                      newImageGenResults[originalIndex] = {
+                          ...newImageGenResults[originalIndex], // Keep existing prompt, image_url, error
+                          wordpress_media_id: uploadResult.wordpress_media_id,
+                          wordpress_media_url: uploadResult.wordpress_media_url,
+                          // We can also clear any previous upload error for this specific item if it now succeeded
+                          // error: null // Or keep it if you want to show original generation error
+                      };
+                  } else if (!uploadResult.success && originalIndex !== -1) {
+                      // If upload failed, ensure we store this error, potentially overwriting a generation error
+                       newImageGenResults[originalIndex] = {
+                           ...newImageGenResults[originalIndex],
+                           error: uploadResult.error || "Upload failed for an unknown reason.", // Store upload error
+                           wordpress_media_id: undefined, // Ensure no stale ID
+                           wordpress_media_url: undefined,
+                       };
+                  }
+                  return { ...uploadResult, originalIndex };
+              })
+              .filter(r => r.success && r.wordpress_media_url && r.wordpress_media_id && r.originalIndex !== -1) as (ImageUploadResult & { originalIndex: number })[];
+
+          setImageGenResults(newImageGenResults); // Update state with WP IDs and URLs
+
           const failedUploads = uploadResponse.results.filter(r => !r.success);
-          const successCount = successfulUploads.length;
+          const successCount = successfulUploadsWithDetails.length;
           const failureCount = failedUploads.length;
 
            let uploadFeedback = `Upload complete. Success: ${successCount}, Failed: ${failureCount}.`;
@@ -772,6 +811,19 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
            }
            displayFeedback(uploadFeedback, failureCount > 0 ? "warning" : "success");
 
+          // Update selectedFeaturedMediaId check
+          if (selectedFeaturedMediaId) {
+              const isStillValid = successfulUploadsWithDetails.some(up => up.wordpress_media_id === selectedFeaturedMediaId);
+              if (!isStillValid) {
+                  console.warn("Previously selected featured image failed to upload or was unselected. Clearing.");
+                  setSelectedFeaturedMediaId(null);
+                   // Optionally, auto-select the first successful upload as featured
+                   if (successfulUploadsWithDetails.length > 0 && successfulUploadsWithDetails[0].wordpress_media_id) {
+                      // setSelectedFeaturedMediaId(successfulUploadsWithDetails[0].wordpress_media_id);
+                      // displayFeedback("Previously featured image failed. First successful upload auto-selected as featured.", "info");
+                   }
+              }
+          }
 
           // --- Step 2: Get Article with Placeholders via LLM (if any uploads succeeded) ---
           if (successCount > 0 && generatedArticle) {
@@ -780,24 +832,19 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                 displayFeedback(`Asking LLM to suggest placement for ${successCount} image(s)...`, "warning");
 
                  // Map successful uploads to the details needed by the LLM/backend
-                const imagesForLLM: ImageDetailsForLLM[] = successfulUploads.map((result, idx) => {
-                     const uploadedItem = imagesToUpload.find(item => item.url === result.original_url);
-                     const originalIndex = uploadedItem ? uploadedItem.originalIndex : -1;
-
-                    // Use custom alt text if available, otherwise fall back to edited prompt, then generic
-                    let altText = `Image for ${projectName}`; // Generic fallback
-                    if (originalIndex !== -1) {
-                        altText = promptAltTexts[originalIndex] || editedPrompts[originalIndex] || `Image ${originalIndex + 1} for ${projectName}`;
-                    }
-
-                    return {
-                        wordpress_media_url: result.wordpress_media_url!,
-                        wordpress_media_id: result.wordpress_media_id!,
-                        alt_text: altText.replace(/"/g, '&quot;'), // Escape quotes
-                        placeholder_index: idx + 1 // Assign sequential index (1, 2, 3...) for placeholders
-                    };
+                const imagesForLLM: ImageDetailsForLLM[] = successfulUploadsWithDetails.map((result, idx) => {
+                     const originalIndex = result.originalIndex;
+                     let altText = `Image for ${projectName}`;
+                     if (originalIndex !== -1) {
+                         altText = promptAltTexts[originalIndex] || editedPrompts[originalIndex] || `Image ${originalIndex + 1} for ${projectName}`;
+                     }
+                     return {
+                         wordpress_media_url: result.wordpress_media_url!,
+                         wordpress_media_id: result.wordpress_media_id!,
+                         alt_text: altText.replace(/"/g, '&quot;'),
+                         placeholder_index: idx + 1
+                     };
                 });
-
 
                 const placeholderRequest: InsertPlaceholdersLLMRequest = {
                     article_html: generatedArticle, // Send current article content
@@ -828,7 +875,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
 
                 setGeneratedArticle(finalArticleContent); // Update article state with final result
                 displayFeedback(`Image placement complete. ${replacementsMade}/${successCount} images inserted. (Failed Uploads: ${failureCount})`, replacementsMade < successCount ? "warning" : "success");
-
 
           } else if (successCount === 0) {
                // Handled by initial feedback after upload
@@ -870,7 +916,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
    }, [currentSettings?.wordpress_url, currentSettings?.wordpress_user, currentSettings?.wordpress_pass, isLoadingSettings, fetchWpCategories]);
 
   const hasWpCredentials = !!(currentSettings?.wordpress_url && currentSettings?.wordpress_user && currentSettings?.wordpress_pass);
-  const anyLoading = isGenerating || isSuggestingPrompts || isPublishing || isUploadingImages || isInsertingPlaceholders || isLoadingSettings || isLoadingWpCategories || isTestingImage;
+  const anyLoading = isGenerating || isSuggestingPrompts || isPublishing || isUploadingImages || isInsertingPlaceholders || isLoadingSettings || isLoadingWpCategories;
 
   return (
     <div className="page-container">
@@ -879,295 +925,319 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
              <button onClick={onBack} disabled={anyLoading}>&larr; Back to Projects</button>
         </div>
 
-        {/* --- Article Configuration Card --- */}
-        <div className="card">
-            <h2>Article Configuration</h2>
-            <div>
-                {/* Global Info - Tool Name */}
-                <div className="row">
-                    <label htmlFor="toolName">Tool Name:</label>
-                    <input
-                       id="toolName" type="text" value={toolNameInput}
-                       onChange={(e) => setToolNameInput(e.target.value)}
-                       placeholder="Enter the name of the AI tool" required disabled={anyLoading}
-                     />
-                </div>
+        {/* --- Stage 1: Define Article Blueprint & Generate --- */}
+        {!generatedArticle && (
+            <div className="card">
+                <h2>Step 1: Define Article Blueprint &amp; Generate</h2>
+                <div>
+                    {/* Global Info - Tool Name */}
+                    <div className="row">
+                        <label htmlFor="toolName">Tool Name:</label>
+                        <input
+                           id="toolName" type="text" value={toolNameInput}
+                           onChange={(e) => setToolNameInput(e.target.value)}
+                           placeholder="Enter the name of the AI tool" required disabled={anyLoading}
+                         />
+                    </div>
 
-                {/* Article Goal/Description */}
-                <div className="row" style={{alignItems: 'flex-start', marginTop: '15px'}}>
-                    <label htmlFor="goalPrompt">Article Goal/Description:</label>
-                    <textarea
-                       id="goalPrompt"
-                       name="article_goal_prompt"
-                       value={articleGoalPromptInput}
-                       onChange={(e) => setArticleGoalPromptInput(e.target.value)}
-                       rows={4}
-                       placeholder="Describe the main goal and focus for articles generated in this project..."
-                       disabled={anyLoading}
-                       style={{ flexGrow: 1 }}/>
-                </div>
+                    {/* Article Goal/Description */}
+                    <div className="row" style={{alignItems: 'flex-start', marginTop: '15px'}}>
+                        <label htmlFor="goalPrompt">Article Goal/Description:</label>
+                        <textarea
+                           id="goalPrompt"
+                           name="article_goal_prompt"
+                           value={articleGoalPromptInput}
+                           onChange={(e) => setArticleGoalPromptInput(e.target.value)}
+                           rows={4}
+                           placeholder="Describe the main goal and focus for articles generated in this project..."
+                           disabled={anyLoading}
+                           style={{ flexGrow: 1 }}/>
+                    </div>
 
-                {/* Example URL */}
-                <div className="row" style={{marginTop: '15px'}}>
-                    <label htmlFor="exampleUrl">Example URL (Optional):</label>
-                    <input
-                        type="url"
-                        id="exampleUrl"
-                        name="example_url"
-                        value={exampleUrlInput}
-                        onChange={(e) => setExampleUrlInput(e.target.value)}
-                        placeholder="https://www.example-review.com/some-article"
-                        disabled={anyLoading} />
-                </div>
+                    {/* Example URL */}
+                    <div className="row" style={{marginTop: '15px'}}>
+                        <label htmlFor="exampleUrl">Example URL (Optional):</label>
+                        <input
+                            type="url"
+                            id="exampleUrl"
+                            name="example_url"
+                            value={exampleUrlInput}
+                            onChange={(e) => setExampleUrlInput(e.target.value)}
+                            placeholder="https://www.example-review.com/some-article"
+                            disabled={anyLoading} />
+                    </div>
 
-                {/* --- NEW Model Selection --- */}
-                <div className="row" style={{marginTop: '15px'}}>
-                    <label htmlFor="textModel">Text Generation Model:</label>
-                    <select
-                        id="textModel"
-                        value={textModelInput}
-                        onChange={(e) => setTextModelInput(e.target.value as TextModel)}
-                        disabled={anyLoading}
-                    >
-                        {textGenerationModels.map(model => (
-                            <option key={model} value={model}>{model}</option>
-                        ))}
-                    </select>
-                </div>
-
-                {/* --- NEW Target Word Count --- */}
-                <div className="row" style={{marginTop: '15px'}}>
-                    <label htmlFor="wordCount">Target Word Count:</label>
-                    <input
-                        type="number"
-                        id="wordCount"
-                        value={wordCountInput}
-                        onChange={(e) => setWordCountInput(e.target.value)}
-                        min="50" // Set a minimum
-                        step="50"
-                        placeholder="e.g., 1000"
-                        disabled={anyLoading}
-                        style={{ width: '100px' }} // Adjust width if needed
-                    />
-                </div>
-
-                {/* Dynamic Section Inputs */}
-                <h3 style={{ marginTop: '30px', borderTop: '1px solid #eee', paddingTop: '20px' }}>Article Sections:</h3>
-                {isLoadingSettings && <p>Loading sections...</p>}
-                {!isLoadingSettings && sectionDefinitions.length === 0 && <p>No sections defined yet. Click "Add Section" to start.</p>}
-                {!isLoadingSettings && sectionDefinitions.map((section, index) => (
-                     <div key={section.id} className="card section-editor" style={{ background: '#f8f9fa', marginBottom: '15px', border: '1px solid #dee2e6', padding: '15px' }}>
-                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-                             <h4>Section {index + 1}</h4>
-                             <div className="section-controls" style={{ display: 'flex', gap: '5px' }}>
-                                 <button type="button" onClick={() => handleMoveSection(section.id, 'up')} disabled={index === 0 || anyLoading} title="Move Up" style={{ padding: '0.3em 0.6em'}}>&#8593;</button>
-                                 <button type="button" onClick={() => handleMoveSection(section.id, 'down')} disabled={index === sectionDefinitions.length - 1 || anyLoading} title="Move Down" style={{ padding: '0.3em 0.6em'}}>&#8595;</button>
-                                 <button type="button" onClick={() => handleRemoveSection(section.id)} disabled={anyLoading} title="Remove Section" style={{ padding: '0.3em 0.6em', color: 'red' }}>&times;</button>
-                             </div>
-                         </div>
-                         <div className="row" style={{ alignItems: 'flex-start' }}>
-                             <label htmlFor={`section-instructions-${section.id}`} style={{ minWidth: '100px' }}>Instructions:</label>
-                             <textarea
-                                id={`section-instructions-${section.id}`}
-                                value={section.instructions}
-                                onChange={(e) => handleSectionChange(section.id, e.target.value)}
-                                rows={5}
-                                placeholder={`Enter detailed prompt/instructions for section ${index + 1}...`}
-                                required
-                                disabled={anyLoading}
-                             />
-                         </div>
-                     </div>
-                 ))}
-
-                {/* Buttons specific to Article Configuration */}
-                <div style={{ marginTop: '15px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
-                    {!isLoadingSettings && (
-                         <button type="button" onClick={handleAddSection} disabled={anyLoading} >
-                             + Add Section
-                         </button>
-                     )}
-                     {!isLoadingSettings && (
-                         <button
-                            type="button"
-                            onClick={handleSaveArticleConfig}
-                            disabled={anyLoading || !toolNameInput.trim() || !articleGoalPromptInput.trim()}
-                         >
-                             Save Article Config
-                         </button>
-                     )}
-                </div>
-
-                 {/* Generate Button */}
-                 <button
-                     type="button"
-                     onClick={() => handleGenerateFullArticle()}
-                     disabled={anyLoading || sectionDefinitions.length === 0 || !toolNameInput.trim() || !articleGoalPromptInput.trim() || !wordCountInput || parseInt(wordCountInput) <=0 }
-                     style={{ marginTop: '20px', display: 'block', width: '100%' }}>
-                     {anyLoading ? "Generating..." : "Generate Full Article"}
-                 </button>
-             </div>
-              {/* Display Generated Article Area */}
-                 <div className="generated-article-container" style={{ marginTop: '20px', borderTop: '1px solid #eee', paddingTop: '20px' }}>
-                     <h3>Generated Full Article HTML:</h3>
-                     <textarea
-                        readOnly
-                        value={generatedArticle || "Article will appear here after generation..."}
-                        placeholder="Article will appear here after generation..." // Added placeholder
-                        style={{ width: '100%', minHeight: '400px', whiteSpace: 'pre-wrap', wordWrap: 'break-word', background: '#f9f9f9', padding: '15px', borderRadius: '4px', border: '1px solid #ccc', boxSizing: 'border-box', fontFamily: 'monospace' }}
-                     />
-
-                     {/* --- Category Selector --- */}
-                     <div className="row" style={{ marginTop: '15px', marginBottom: '10px', alignItems: 'center' }}>
-                        <label htmlFor="wpCategory" style={{ marginRight: '10px', minWidth: '120px' }}>WP Category:</label>
+                    {/* --- NEW Model Selection --- */}
+                    <div className="row" style={{marginTop: '15px'}}>
+                        <label htmlFor="textModel">Text Generation Model:</label>
                         <select
-                            id="wpCategory"
-                            value={selectedWpCategoryId}
-                            onChange={(e) => setSelectedWpCategoryId(e.target.value)}
-                            disabled={anyLoading || isPublishing || wpCategories.length === 0}
-                            style={{ flexGrow: 1 }}
+                            id="textModel"
+                            value={textModelInput}
+                            onChange={(e) => setTextModelInput(e.target.value as TextModel)}
+                            disabled={anyLoading}
                         >
-                            <option value="">-- Select Category (Optional) --</option>
-                            {isLoadingWpCategories && <option value="" disabled>Loading categories...</option>}
-                            {wpCategories.map(cat => (
-                                <option key={cat.id} value={String(cat.id)}>{cat.name}</option>
+                            {textGenerationModels.map(model => (
+                                <option key={model} value={model}>{model}</option>
                             ))}
                         </select>
-                        <button
-                            type="button"
-                            onClick={fetchWpCategories}
-                            disabled={anyLoading || isPublishing || !currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass}
-                            style={{ marginLeft: '10px', padding: '0.4em 0.8em' }}
-                            title="Refresh Category List"
-                        >
-                             &#x21bb; {/* Refresh Symbol */}
-                         </button>
-                     </div>
+                    </div>
 
-                     {/* Button Group for Generated Article */}
-                     <div style={{ marginTop: '5px', display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
-                         <button
-                            type="button"
-                            onClick={handleSuggestImagePrompts}
-                            disabled={anyLoading || isPublishing || isInsertingPlaceholders || !generatedArticle}
-                         >
-                            {isSuggestingPrompts ? 'Suggesting...' : 'Suggest Image Prompts'}
-                         </button>
-                         <button
-                            type="button"
-                            onClick={handlePublishToWordPress}
-                            disabled={anyLoading || isPublishing || isInsertingPlaceholders || isLoadingWpCategories || !generatedArticle || !hasWpCredentials}
-                            title={!hasWpCredentials ? "Configure WP settings first" : "Publish to WordPress"}
-                         >
-                            {isPublishing ? 'Publishing...' : 'Publish Article'}
-                         </button>
-                         <button
-                             type="button"
-                             onClick={handleUploadAndInsertImages}
-                             disabled={anyLoading || isPublishing || isInsertingPlaceholders || selectedImageIndices.size === 0 || !hasWpCredentials}
-                             title={!hasWpCredentials ? "Configure WP settings first" : selectedImageIndices.size === 0 ? "Select generated images below first" : "Upload selected images & Insert into Article"}
-                             style={{ marginLeft: 'auto' }}
-                         >
-                             {isUploadingImages ? 'Uploading...' : isInsertingPlaceholders ? 'Placing Images...' : `Upload & Place (${selectedImageIndices.size})`}
-                         </button>
-                     </div>
-                 </div>
-        </div>
-
-        {/* --- NEW Image Prompt Suggestion & Generation Card --- */}
-        {suggestedPrompts && suggestedPrompts.length > 0 && (
-            <div className="card">
-                <h2>Image Prompt Suggestions</h2>
-                {suggestedPrompts.map((_, index) => (
-                    <div key={`prompt-${index}`} className="image-prompt-section" style={{ marginBottom: '25px', paddingBottom: '25px', borderBottom: '1px solid #eee' }}>
-                        <label htmlFor={`prompt-input-${index}`} style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold' }}>Prompt {index + 1}:</label>
-                        <textarea
-                            id={`prompt-input-${index}`}
-                            value={editedPrompts[index] || ''}
-                            onChange={(e) => handleEditedPromptChange(index, e.target.value)}
-                            rows={3}
-                            placeholder={`Edit suggested prompt ${index + 1}...`}
+                    {/* --- NEW Target Word Count --- */}
+                    <div className="row" style={{marginTop: '15px'}}>
+                        <label htmlFor="wordCount">Target Word Count:</label>
+                        <input
+                            type="number"
+                            id="wordCount"
+                            value={wordCountInput}
+                            onChange={(e) => setWordCountInput(e.target.value)}
+                            min="50" // Set a minimum
+                            step="50"
+                            placeholder="e.g., 1000"
                             disabled={anyLoading}
-                            style={{ width: '100%', minHeight: '60px', marginBottom: '10px', boxSizing: 'border-box' }}
+                            style={{ width: '100px' }} // Adjust width if needed
                         />
+                    </div>
 
-                        {/* --- NEW Alt Text Input --- */}
-                        <div className="row" style={{ marginBottom: '10px' }}>
-                            <label htmlFor={`prompt-alt-text-${index}`} style={{ minWidth: '100px' }}>Alt Text:</label>
-                            <input
-                                type="text"
-                                id={`prompt-alt-text-${index}`}
-                                value={promptAltTexts[index] || ''}
-                                onChange={(e) => handlePromptAltTextChange(index, e.target.value)}
-                                placeholder="Describe the image for accessibility/SEO"
-                                disabled={anyLoading}
-                                style={{ flexGrow: 1 }}
-                            />
-                        </div>
-                        {/* --- End NEW Alt Text Input --- */}
-
-                        {/* --- Controls Row (Dropdown + Button) --- */}
-                        <div className="row" style={{ marginBottom: '15px', gap: '15px' }}>
-                            {/* Aspect Ratio Selector */}
-                            <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1 }}>
-                                <label htmlFor={`prompt-aspect-${index}`} style={{ marginBottom: '3px', textAlign: 'left', minWidth: 'auto' }}>Aspect Ratio:</label>
-                                <select
-                                    id={`prompt-aspect-${index}`}
-                                    value={promptAspectRatios[index] || "16x9"}
-                                    onChange={(e) => handlePromptAspectRatioChange(index, e.target.value)}
-                                    disabled={anyLoading}
-                                >
-                                    {ideogramAspectRatios.map(ratio => (
-                                        <option key={ratio} value={ratio}>{ratio}</option>
-                                    ))}
-                                </select>
-                            </div>
-                            {/* Generate Button */}
-                            <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
-                                <button
-                                    type="button"
-                                    onClick={() => handleGenerateSpecificImage(index)}
-                                    disabled={anyLoading || !editedPrompts[index]?.trim()}
-                                >
-                                    {isGeneratingImage[index] ? 'Generating...' : 'Generate Image'}
-                                </button>
-                            </div>
-                        </div>
-
-                        {/* Display Result for this prompt */}
-                        {imageGenResults[index] && (
-                             <div className="image-result-area" style={{ marginTop: '10px' }}>
-                                 {imageGenResults[index].error && <p style={{ color: 'red' }}>Error: {imageGenResults[index].error}</p>}
-                                 {imageGenResults[index].image_url && (
-                                     <div>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '5px' }}>
-                                            <input
-                                                type="checkbox"
-                                                id={`select-image-${index}`}
-                                                checked={selectedImageIndices.has(index)}
-                                                onChange={() => handleImageSelectionChange(index)}
-                                                disabled={anyLoading}
-                                                style={{ transform: 'scale(1.2)' }}
-                                            />
-                                            <label htmlFor={`select-image-${index}`} style={{ fontWeight: '500', cursor: 'pointer' }}>Select this Image</label>
-                                        </div>
-                                         <img
-                                            src={imageGenResults[index].image_url!}
-                                            alt={promptAltTexts[index] || `Generated image for prompt ${index + 1}`}
-                                            style={{ maxWidth: '100%', maxHeight: '350px', height: 'auto', marginTop: '5px', border: '1px solid #ddd', borderRadius: '4px' }}
-                                          />
-                                     </div>
-                                 )}
+                    {/* Dynamic Section Inputs */}
+                    <h3 style={{ marginTop: '30px', borderTop: '1px solid #eee', paddingTop: '20px' }}>Article Sections:</h3>
+                    {isLoadingSettings && <p>Loading sections...</p>}
+                    {!isLoadingSettings && sectionDefinitions.length === 0 && <p>No sections defined yet. Click "Add Section" to start.</p>}
+                    {!isLoadingSettings && sectionDefinitions.map((section, index) => (
+                         <div key={section.id} className="card section-editor" style={{ background: '#f8f9fa', marginBottom: '15px', border: '1px solid #dee2e6', padding: '15px' }}>
+                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
+                                 <h4>Section {index + 1}</h4>
+                                 <div className="section-controls" style={{ display: 'flex', gap: '5px' }}>
+                                     <button type="button" onClick={() => handleMoveSection(section.id, 'up')} disabled={index === 0 || anyLoading} title="Move Up" style={{ padding: '0.3em 0.6em'}}>&#8593;</button>
+                                     <button type="button" onClick={() => handleMoveSection(section.id, 'down')} disabled={index === sectionDefinitions.length - 1 || anyLoading} title="Move Down" style={{ padding: '0.3em 0.6em'}}>&#8595;</button>
+                                     <button type="button" onClick={() => handleRemoveSection(section.id)} disabled={anyLoading} title="Remove Section" style={{ padding: '0.3em 0.6em', color: 'red' }}>&times;</button>
+                                 </div>
                              </div>
+                             <div className="row" style={{ alignItems: 'flex-start' }}>
+                                 <label htmlFor={`section-instructions-${section.id}`} style={{ minWidth: '100px' }}>Instructions:</label>
+                                 <textarea
+                                    id={`section-instructions-${section.id}`}
+                                    value={section.instructions}
+                                    onChange={(e) => handleSectionChange(section.id, e.target.value)}
+                                    rows={5}
+                                    placeholder={`Enter detailed prompt/instructions for section ${index + 1}...`}
+                                    required
+                                    disabled={anyLoading}
+                                 />
+                             </div>
+                         </div>
+                     ))}
+
+                    {/* Buttons specific to Article Configuration */}
+                    <div style={{ marginTop: '15px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
+                        {!isLoadingSettings && (
+                             <button type="button" onClick={handleAddSection} disabled={anyLoading} >
+                                 + Add Section
+                             </button>
+                         )}
+                         {!isLoadingSettings && (
+                             <button
+                                type="button"
+                                onClick={handleSaveArticleConfig}
+                                disabled={anyLoading || !toolNameInput.trim() || !articleGoalPromptInput.trim()}
+                             >
+                                 Save Article Blueprint
+                             </button>
                          )}
                     </div>
-                ))}
+
+                     {/* Generate Button */}
+                     <button
+                         type="button"
+                         onClick={() => handleGenerateFullArticle()}
+                         disabled={anyLoading || sectionDefinitions.length === 0 || !toolNameInput.trim() || !articleGoalPromptInput.trim() || !wordCountInput || parseInt(wordCountInput) <=0 }
+                         style={{ marginTop: '20px', display: 'block', width: '100%', padding: '10px', fontSize: '1.1em' }}
+                        >
+                         {isGenerating ? "Generating..." : "Generate Full Article"}
+                     </button>
+                 </div>
             </div>
         )}
 
-        {/* --- Project Base Settings Card --- */}
-        <div className="card">
-            <h2>Project Base Settings</h2>
+        {/* --- Stage 2: Review, Add Images, and Publish --- */}
+        {generatedArticle && (
+            <div className="card">
+                <h2>Step 2: Review, Add Images &amp; Publish</h2>
+
+                {/* A. Generated Article Preview */}
+                <div className="generated-article-container" style={{ marginBottom: '20px', borderBottom: '1px solid #eee', paddingBottom: '20px' }}>
+                    <h3>Generated Article HTML:</h3>
+                     <textarea
+                        readOnly
+                        value={generatedArticle} // No fallback needed here as it's conditional
+                        style={{ width: '100%', minHeight: '300px', whiteSpace: 'pre-wrap', wordWrap: 'break-word', background: '#f9f9f9', padding: '15px', borderRadius: '4px', border: '1px solid #ccc', boxSizing: 'border-box', fontFamily: 'monospace', marginBottom: '15px' }}
+                     />
+                     <button
+                        type="button"
+                        onClick={handleSuggestImagePrompts}
+                        disabled={anyLoading || isPublishing || isInsertingPlaceholders}
+                        style={{marginRight: '10px'}}
+                    >
+                        {isSuggestingPrompts ? 'Suggesting...' : 'Suggest Image Prompts for Article'}
+                    </button>
+                </div>
+
+                {/* B. Image Workspace (conditionally rendered) */}
+                {suggestedPrompts && suggestedPrompts.length > 0 && (
+                    <div className="image-workspace-container" style={{ marginBottom: '20px', borderBottom: '1px solid #eee', paddingBottom: '20px' }}>
+                        <h3>Image Workspace</h3>
+                        {suggestedPrompts.map((_, index) => {
+                            const imageResult = imageGenResults[index];
+                            const hasBeenUploadedSuccessfully = !!imageResult?.wordpress_media_id;
+                            const isCurrentlyFeatured = selectedFeaturedMediaId === imageResult?.wordpress_media_id;
+
+                            return (
+                            <div key={`prompt-${index}`} className="image-prompt-section" style={{ marginBottom: '25px', paddingBottom: '25px', borderBottom: '1px dashed #ddd' }}>
+                                <label htmlFor={`prompt-input-${index}`} style={{ display: 'block', marginBottom: '8px', fontWeight: 'bold' }}>Prompt {index + 1}:</label>
+                                <textarea
+                                    id={`prompt-input-${index}`}
+                                    value={editedPrompts[index] || ''}
+                                    onChange={(e) => handleEditedPromptChange(index, e.target.value)}
+                                    rows={3}
+                                    placeholder={`Edit suggested prompt ${index + 1}...`}
+                                        disabled={anyLoading}
+                                        style={{ width: '100%', minHeight: '60px', marginBottom: '10px', boxSizing: 'border-box' }}
+                                    />
+                                    <div className="row" style={{ marginBottom: '10px' }}>
+                                        <label htmlFor={`prompt-alt-text-${index}`} style={{ minWidth: '100px' }}>Alt Text:</label>
+                                        <input
+                                            type="text"
+                                            id={`prompt-alt-text-${index}`}
+                                            value={promptAltTexts[index] || ''}
+                                            onChange={(e) => handlePromptAltTextChange(index, e.target.value)}
+                                            placeholder="Describe the image for accessibility/SEO"
+                                            disabled={anyLoading}
+                                            style={{ flexGrow: 1 }}
+                                        />
+                                    </div>
+                                <div className="row" style={{ marginBottom: '15px', gap: '15px' }}>
+                                        <div style={{ display: 'flex', flexDirection: 'column', flexGrow: 1 }}>
+                                        <label htmlFor={`prompt-aspect-${index}`} style={{ marginBottom: '3px', textAlign: 'left', minWidth: 'auto' }}>Aspect Ratio:</label>
+                                        <select
+                                            id={`prompt-aspect-${index}`}
+                                            value={promptAspectRatios[index] || "16x9"}
+                                            onChange={(e) => handlePromptAspectRatioChange(index, e.target.value)}
+                                                disabled={anyLoading}
+                                        >
+                                            {ideogramAspectRatios.map(ratio => (
+                                                <option key={ratio} value={ratio}>{ratio}</option>
+                                            ))}
+                                        </select>
+                                    </div>
+                                        <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
+                                        <button
+                                            type="button"
+                                            onClick={() => handleGenerateSpecificImage(index)}
+                                                disabled={anyLoading || !editedPrompts[index]?.trim()}
+                                        >
+                                            {isGeneratingImage[index] ? 'Generating...' : 'Generate Image'}
+                                        </button>
+                                    </div>
+                                </div>
+                                    {imageResult?.image_url && (
+                                     <div className="image-result-area" style={{ marginTop: '10px' }}>
+                                             {imageResult.error && <p style={{ color: 'red' }}>Error: {imageResult.error}</p>}
+                                             {imageResult.image_url && (
+                                             <div>
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '5px' }}>
+                                                        <input
+                                                            type="checkbox"
+                                                            id={`select-image-${index}`}
+                                                            checked={selectedImageIndices.has(index)}
+                                                            onChange={() => handleImageSelectionChange(index)}
+                                                            disabled={anyLoading}
+                                                        />
+                                                        <label htmlFor={`select-image-${index}`} style={{ fontWeight: 'normal', cursor: 'pointer', flexGrow: 1 }}>Select for Article Insertion</label>
+                                                        {hasBeenUploadedSuccessfully && (
+                                                            <>
+                                                                <input
+                                                                    type="radio"
+                                                                    id={`feature-image-${index}`}
+                                                                    name="featuredImage"
+                                                                    checked={isCurrentlyFeatured}
+                                                                    onChange={() => handleSetFeaturedImage(index)}
+                                                                    disabled={anyLoading || !selectedImageIndices.has(index)}
+                                                                    title={selectedImageIndices.has(index) ? "Set as Featured Image" : "Select for insertion first to set as featured"}
+                                                                />
+                                                                <label htmlFor={`feature-image-${index}`} style={{ fontWeight: 'normal', cursor: 'pointer', color: selectedImageIndices.has(index) ? 'inherit' : '#aaa' }}>
+                                                                    Set as Featured
+                                                                </label>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                     <img
+                                                        src={imageResult.image_url}
+                                                        alt={promptAltTexts[index] || `Generated image for prompt ${index + 1}`}
+                                                    style={{ maxWidth: '100%', maxHeight: '350px', height: 'auto', marginTop: '5px', border: '1px solid #ddd', borderRadius: '4px' }}
+                                                  />
+                                             </div>
+                                         )}
+                                     </div>
+                                 )}
+                            </div>
+                            );
+                        })}
+                        <button
+                             type="button"
+                             onClick={handleUploadAndInsertImages}
+                             disabled={anyLoading || isPublishing || isInsertingPlaceholders || selectedImageIndices.size === 0 || !hasWpCredentials}
+                             title={!hasWpCredentials ? "Configure WP settings first" : selectedImageIndices.size === 0 ? "Select generated images first" : "Upload selected images & Insert into Article"}
+                             style={{ display: 'block', width: '100%', padding: '10px', fontSize: '1.0em', marginTop: '10px' }}
+                         >
+                             {isUploadingImages ? 'Uploading Images...' : isInsertingPlaceholders ? 'Inserting Images into Article...' : `Upload (${selectedImageIndices.size}) Selected Images & Insert into Article`}
+                        </button>
+                    </div>
+                )}
+
+                {/* C. Publishing Options */}
+                <div className="publishing-options-container">
+                    <h3>Publishing Options</h3>
+                    <div className="row" style={{ marginBottom: '10px', alignItems: 'center' }}>
+                       <label htmlFor="wpCategory" style={{ marginRight: '10px', minWidth: '120px' }}>WP Category:</label>
+                       <select
+                           id="wpCategory"
+                           value={selectedWpCategoryId}
+                           onChange={(e) => setSelectedWpCategoryId(e.target.value)}
+                           disabled={anyLoading || isPublishing || wpCategories.length === 0 || !hasWpCredentials}
+                           style={{ flexGrow: 1 }}
+                       >
+                           <option value="">-- Select Category (Optional) --</option>
+                           {isLoadingWpCategories && <option value="" disabled>Loading categories...</option>}
+                           {wpCategories.map(cat => (
+                               <option key={cat.id} value={String(cat.id)}>{cat.name}</option>
+                           ))}
+                       </select>
+                       <button
+                           type="button"
+                           onClick={fetchWpCategories}
+                           disabled={anyLoading || isPublishing || !hasWpCredentials}
+                           style={{ marginLeft: '10px', padding: '0.4em 0.8em' }}
+                           title="Refresh Category List"
+                       >
+                            &#x21bb; {/* Refresh Symbol */}
+                        </button>
+                    </div>
+                    <button
+                       type="button"
+                       onClick={handlePublishToWordPress}
+                       disabled={anyLoading || isPublishing || isInsertingPlaceholders || isLoadingWpCategories || !hasWpCredentials}
+                       title={!hasWpCredentials ? "Configure WP settings first (in Project Base Settings below)" : "Publish to WordPress"}
+                       style={{ display: 'block', width: '100%', padding: '10px', fontSize: '1.1em', marginTop: '15px' }}
+                    >
+                       {isPublishing ? 'Publishing...' : 'Publish Article to WordPress'}
+                    </button>
+                </div>
+            </div>
+        )}
+
+
+        {/* --- Project Base Settings Card (Persistent at the bottom or as Stage 0) --- */}
+        <div className="card" style={{marginTop: '30px'}}>
+            <h2>Project Base Settings (WordPress &amp; Admin)</h2>
             {isLoadingSettings && <p>Loading settings...</p>}
             {!isLoadingSettings && currentSettings && (
                 <form onSubmit={handleSaveBaseSettings}>

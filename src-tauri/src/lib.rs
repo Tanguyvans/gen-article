@@ -169,6 +169,7 @@ struct PublishRequest {
     article_html: String,
     publish_status: Option<String>,
     category_id: Option<u32>,
+    featured_media_id: Option<u32>,
 }
 
 #[derive(Serialize, Debug)]
@@ -178,6 +179,8 @@ struct WordPressPostPayload<'a> {
     status: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     categories: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    featured_media: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -587,7 +590,7 @@ Balise <meta description> : 150-160 caractères, incluant un call-to-action enga
 Balise <h1> : Optimisée pour le lecteur, engageante, différente du <title>, axée sur un bénéfice clé (ex. "Pourquoi {tool_name} révolutionne vos projets IA en 2025").
 Balises H2: Générez des titres H2 descriptifs et pertinents pour chaque section définie ci-dessus en vous basant sur les instructions fournies pour cette section.
 Liens hypertextes : Inclure un lien vers le site officiel de l'outil dans l'introduction, les tarifs, et la conclusion, et des liens vers les sites des alternatives dans la section correspondante. Ne pas inclure de liens vers des sources de recherche.
-Style CSS : Intégré dans la balise <style> pour un tableau esthétique (bordures, couleurs alternées, padding) et une mise en page lisible (polices claires, espacement).
+Style HTML : NE PAS INCLURE de balise <style> ni de styles CSS en ligne. Générer du HTML sémantique et brut uniquement. Si des tableaux sont nécessaires, utilisez des balises HTML standard (<table>, <tr>, <th>, <td>) sans aucun style CSS.
 Respecter les conventions typographiques françaises : minuscules sauf pour débuts de phrases, titres, et noms propres.
 Utiliser un ton engageant, professionnel, et accessible, avec des exemples concrets pour illustrer les cas d'usage.
 Assurez-vous que la sortie est uniquement le code HTML complet de l'article, en commençant par <!DOCTYPE html> ou <html> et se terminant par </html>. N'incluez AUCUN texte ou explication avant ou après le code HTML.
@@ -887,6 +890,10 @@ async fn publish_to_wordpress(
     if let Some(cat_id) = request.category_id {
         println!("Rust: Requested category ID: {}", cat_id);
     }
+    match request.featured_media_id {
+        Some(fm_id) => println!("Rust: Requested Featured Media ID: {}", fm_id),
+        None => println!("Rust: No Featured Media ID requested (was None)."),
+    }
 
     let settings = get_project_settings(app.clone(), request.project_name.clone())
         .await?
@@ -933,6 +940,7 @@ async fn publish_to_wordpress(
         content: &request.article_html,
         status: publish_status,
         categories: request.category_id.map(|id| vec![id]),
+        featured_media: request.featured_media_id,
     };
 
     let client = Client::new();
@@ -954,15 +962,18 @@ async fn publish_to_wordpress(
         status
     );
 
-    if status.is_success() {
+    if status.is_success() || status.as_u16() == 201 {
         let response_text = response.text().await.unwrap_or_default();
         println!("Rust: WordPress API Success Response: {}", response_text);
         let category_msg = request
             .category_id
             .map_or("".to_string(), |id| format!(" in category ID {}", id));
+        let featured_msg = request.featured_media_id.map_or("".to_string(), |id| {
+            format!(" with featured image ID {}", id)
+        });
         Ok(format!(
-            "Article successfully published to WordPress with status '{}'{}!",
-            publish_status, category_msg
+            "Article successfully published to WordPress with status '{}'{} {}!",
+            publish_status, category_msg, featured_msg
         ))
     } else {
         let error_text = response
