@@ -164,6 +164,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   const [wpCategories, setWpCategories] = useState<WordPressCategory[]>([]);
   const [isLoadingWpCategories, setIsLoadingWpCategories] = useState(false);
   const [selectedWpCategoryId, setSelectedWpCategoryId] = useState<string>(''); // Store ID as string for select value
+  const [articleSlugInput, setArticleSlugInput] = useState<string>(''); // <-- NEW state for slug
 
   // --- NEW State for Image Selection and Upload ---
   const [selectedImageIndices, setSelectedImageIndices] = useState<Set<number>>(new Set());
@@ -182,40 +183,46 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   const fetchWpCategories = useCallback(async () => {
     if (!currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass) {
         setWpCategories([]);
-        setSelectedWpCategoryId('');
+        // Don't clear selectedWpCategoryId here, let the main effect handle it if creds are invalid
         return;
     }
     setIsLoadingWpCategories(true);
-    // We will check and potentially reset selectedWpCategoryId *after* the fetch attempt.
+
+    let currentSelection = selectedWpCategoryId; // Capture current selection before async
 
     try {
         const categories = await invoke<WordPressCategory[]>("get_wordpress_categories", { projectName });
-        setWpCategories(categories || []);
+        const fetchedCategories = categories || [];
+        setWpCategories(fetchedCategories);
 
-        if (categories && categories.length > 0) {
-            const currentSelectionStillValid = categories.some(cat => String(cat.id) === selectedWpCategoryId);
-            if (!currentSelectionStillValid) {
-                // If the previously selected category ID is no longer in the fetched list, clear it.
+        if (fetchedCategories.length > 0) {
+            const selectionStillValid = fetchedCategories.some(cat => String(cat.id) === currentSelection);
+            if (!selectionStillValid) {
+                // If the captured selection is no longer valid (e.g., category deleted from WP), clear it.
+                // Otherwise, if currentSelection was empty, it remains empty (user hasn't picked one).
                 setSelectedWpCategoryId('');
             }
-            // If currentSelectionStillValid is true, selectedWpCategoryId remains as is.
+            // If selectionStillValid is true, and currentSelection had a value, it implies the UI should still reflect that.
+            // The selectedWpCategoryId state should already hold the correct value from the dropdown's onChange.
         } else {
-            // No categories found or an empty list was returned
-            displayFeedback("No categories found for the configured WordPress site.", "warning");
-            setSelectedWpCategoryId(''); // Clear selection as there are no categories
+            // No categories fetched or an empty list returned
+            // displayFeedback("No categories found for the configured WordPress site...", "warning"); // Feedback might be too noisy if it's a transient issue
+            setSelectedWpCategoryId(''); // Clear selection
             setWpCategories([]); // Ensure categories state is also empty
         }
     } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
-        if (errorMsg.includes("Status 429 Too Many Requests") && wpCategories.length === 0 && !selectedWpCategoryId) {
-            // Suppress feedback only for true initial load 429 errors where no categories or selection existed.
+        const isInitialLoad429 = errorMsg.includes("Status 429 Too Many Requests") && wpCategories.length === 0 && !selectedWpCategoryId;
+
+        if (isInitialLoad429) {
             console.error("Initial WP category fetch failed with 429 (feedback suppressed): ", errorMsg);
+            setWpCategories([]);
+            setSelectedWpCategoryId('');
         } else {
             console.error("Failed to fetch WP categories:", err);
+            setWpCategories([]);
+            setSelectedWpCategoryId('');
         }
-        // On any error during fetch, clear both categories and selection to be safe.
-        setWpCategories([]);
-        setSelectedWpCategoryId('');
     } finally {
         setIsLoadingWpCategories(false);
     }
@@ -225,10 +232,11 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         currentSettings?.wordpress_user,
         currentSettings?.wordpress_pass,
         displayFeedback,
-        // Only include selectedWpCategoryId here, not wpCategories.length,
-        // to avoid re-fetching if only wpCategories.length changes due to an error clear.
-        // The logic now handles re-validation of selectedWpCategoryId internally.
-        selectedWpCategoryId
+        // REMOVE selectedWpCategoryId from here. The function will use the state value directly.
+        // The purpose of this function is to FETCH and then VALIDATE the selection,
+        // not to re-run *because* the selection changed.
+        // The selection change is handled by the <select> onChange.
+        // Also removing wpCategories.length for previously stated reasons.
   ]);
 
   const fetchProjectSettings = useCallback(async (name: string) => {
@@ -237,35 +245,36 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         setArticleGoalPromptInput("");
         setExampleUrlInput("");
         setToolNameInput("");
-        // --- ADD Reset for new state ---
-        setTextModelInput(DEFAULT_TEXT_MODEL); // Reset model
-        setWordCountInput(String(DEFAULT_WORD_COUNT)); // Reset word count
+        setTextModelInput(DEFAULT_TEXT_MODEL);
+        setWordCountInput(String(DEFAULT_WORD_COUNT));
         setGeneratedArticle(null);
-        setSuggestedPrompts(null); // Clear suggestions
+        setSuggestedPrompts(null);
         setEditedPrompts({});
         setImageGenResults({});
         setIsGeneratingImage({});
-        setPromptAspectRatios({}); // Reset aspect ratios
-        setSelectedImageIndices(new Set()); // Reset selected images
-        setIsUploadingImages(false); // Reset upload state
-        setWpCategories([]); // Clear categories on project load
+        setPromptAspectRatios({});
+        setSelectedImageIndices(new Set());
+        setIsUploadingImages(false);
+        
+        // Clear these before loading new project settings.
+        // The useEffect for categories will trigger a fetch if new settings have valid WP creds.
+        setWpCategories([]); 
         setSelectedWpCategoryId('');
-        setIsLoadingWpCategories(false); // Reset loading state
-        // --- END Reset ---
+        setIsLoadingWpCategories(false);
+        setArticleSlugInput('');
+        
         try {
             const settings = await invoke<ProjectSettings | null>(
                 "get_project_settings", { name: name }
             );
             if (settings) {
-                setCurrentSettings(settings);
+                setCurrentSettings(settings); // This will trigger the category fetch useEffect if WP creds are valid
                 setToolNameInput(settings.toolName || name);
                 setArticleGoalPromptInput(settings.article_goal_prompt || "");
                 setExampleUrlInput(settings.example_url || "");
-                // Set model and word count from loaded settings, falling back to defaults
                 setTextModelInput(settings.text_generation_model as TextModel || DEFAULT_TEXT_MODEL);
                 setWordCountInput(String(settings.target_word_count || DEFAULT_WORD_COUNT));
 
-                // Load Sections
                 if (settings.sections && settings.sections.length > 0) {
                     const loadedSections = settings.sections.map(secData => ({
                         ...secData,
@@ -277,15 +286,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                         { id: getNewSectionId(), instructions: "Write an engaging introduction for [Tool Name]..." }
                     ]);
                 }
-
-                // --- Trigger category fetch AFTER settings are loaded and valid ---
-                if (settings.wordpress_url && settings.wordpress_user && settings.wordpress_pass) {
-                    // Use setTimeout to allow state update before fetching
-                    setTimeout(() => fetchWpCategories(), 0);
-                }
-
             } else {
-                 // Use default values if settings are null
                  setCurrentSettings({
                      wordpress_url: "", wordpress_user: "", wordpress_pass: "",
                      toolName: name, article_goal_prompt: "", example_url: "", sections: [],
@@ -302,8 +303,7 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         } catch (err) {
             console.error("Failed to fetch project settings:", err);
             displayFeedback(`Error fetching settings for ${name}: ${err}`, "error");
-            setCurrentSettings(null); // Indicate error state
-            // Keep default inputs
+            setCurrentSettings(null); 
             setTextModelInput(DEFAULT_TEXT_MODEL);
             setWordCountInput(String(DEFAULT_WORD_COUNT));
             setSectionDefinitions([
@@ -312,12 +312,31 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
         } finally {
             setIsLoadingSettings(false);
         }
-    }, [projectName, displayFeedback, onBack, fetchWpCategories]);
+    }, [projectName, displayFeedback]);
 
   useEffect(() => {
-    nextSectionId = 1;
+    nextSectionId = 1; 
     fetchProjectSettings(projectName);
   }, [projectName, fetchProjectSettings]);
+
+   useEffect(() => {
+     if (!isLoadingSettings && currentSettings?.wordpress_url && currentSettings?.wordpress_user && currentSettings?.wordpress_pass) {
+        // WP credentials are valid and settings are loaded, fetch categories.
+        fetchWpCategories();
+     } else if (!isLoadingSettings) { 
+        // Settings loaded, but WP credentials are NOT valid. Clear category state.
+        setWpCategories([]);
+        setSelectedWpCategoryId('');
+        setIsLoadingWpCategories(false); // Ensure this is reset too
+     }
+     // This effect depends on WP credentials changing or initial settings load finishing.
+   }, [
+        currentSettings?.wordpress_url,
+        currentSettings?.wordpress_user,
+        currentSettings?.wordpress_pass,
+        isLoadingSettings, // Re-run when loading finishes to check credentials
+        fetchWpCategories // fetchWpCategories is memoized and its deps are project/creds/displayFeedback
+    ]);
 
   // --- Save Handlers ---
   const handleSaveBaseSettings = async (e: FormEvent) => {
@@ -661,24 +680,28 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
 
        try {
            const categoryIdNum = selectedWpCategoryId ? parseInt(selectedWpCategoryId, 10) : null;
+           const slugToSend = articleSlugInput.trim() || undefined; // Send undefined if empty to let WP auto-generate
 
-            // --- ADD LOGGING HERE ---
-            console.log("[handlePublishToWordPress] Selected Featured Media ID being sent:", selectedFeaturedMediaId);
-            // --- END LOGGING ---
+           // --- ADD LOGGING HERE ---
+           console.log("[handlePublishToWordPress] Selected Featured Media ID being sent:", selectedFeaturedMediaId);
+           console.log("[handlePublishToWordPress] Slug being sent:", slugToSend); // <-- Log slug
+           // --- END LOGGING ---
 
-           // --- MODIFIED PAYLOAD to include featured_media ---
+           // --- MODIFIED PAYLOAD to include featured_media and slug ---
            const requestPayload: {
                project_name: string;
                article_html: string;
                publish_status?: string;
                category_id?: number | null;
-               featured_media_id?: number | null; // Added
+               featured_media_id?: number | null;
+               slug?: string; // <-- ADDED slug
            } = {
                project_name: projectName,
                article_html: generatedArticle,
                publish_status: "publish", // or "draft"
                category_id: (categoryIdNum && !isNaN(categoryIdNum)) ? categoryIdNum : null,
-               featured_media_id: selectedFeaturedMediaId // Pass the selected media ID
+               featured_media_id: selectedFeaturedMediaId,
+               slug: slugToSend, // <-- ADDED: send slug
            };
            // --- END MODIFICATION ---
 
@@ -902,18 +925,6 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
           setIsInsertingPlaceholders(false);
       }
   };
-
-  // --- Update useEffect to re-fetch categories if WP settings change in the currentSettings state ---
-   useEffect(() => {
-     // Fetch categories whenever the relevant settings change
-     if (!isLoadingSettings && currentSettings?.wordpress_url && currentSettings?.wordpress_user && currentSettings?.wordpress_pass) {
-        fetchWpCategories();
-     } else {
-        // Clear categories if WP settings become invalid
-        setWpCategories([]);
-        setSelectedWpCategoryId('');
-     }
-   }, [currentSettings?.wordpress_url, currentSettings?.wordpress_user, currentSettings?.wordpress_pass, isLoadingSettings, fetchWpCategories]);
 
   const hasWpCredentials = !!(currentSettings?.wordpress_url && currentSettings?.wordpress_user && currentSettings?.wordpress_pass);
   const anyLoading = isGenerating || isSuggestingPrompts || isPublishing || isUploadingImages || isInsertingPlaceholders || isLoadingSettings || isLoadingWpCategories;
@@ -1221,6 +1232,21 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                             &#x21bb; {/* Refresh Symbol */}
                         </button>
                     </div>
+                    {/* --- NEW Slug Input --- */}
+                    <div className="row" style={{ marginBottom: '15px', alignItems: 'center' }}>
+                        <label htmlFor="wpSlug" style={{ marginRight: '10px', minWidth: '120px' }}>Permalink Slug:</label>
+                        <input
+                            type="text"
+                            id="wpSlug"
+                            value={articleSlugInput}
+                            onChange={(e) => setArticleSlugInput(e.target.value)}
+                            placeholder="e.g., my-awesome-article-slug (optional)"
+                            disabled={anyLoading || isPublishing || !hasWpCredentials}
+                            style={{ flexGrow: 1 }}
+                            title="Enter custom permalink slug (part after domain). Leave blank for auto-generation."
+                        />
+                    </div>
+                    {/* --- END NEW Slug Input --- */}
                     <button
                        type="button"
                        onClick={handlePublishToWordPress}

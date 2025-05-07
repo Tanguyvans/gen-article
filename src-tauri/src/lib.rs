@@ -170,6 +170,7 @@ struct PublishRequest {
     publish_status: Option<String>,
     category_id: Option<u32>,
     featured_media_id: Option<u32>,
+    slug: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -181,6 +182,8 @@ struct WordPressPostPayload<'a> {
     categories: Option<Vec<u32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     featured_media: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slug: Option<&'a str>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -894,6 +897,9 @@ async fn publish_to_wordpress(
         Some(fm_id) => println!("Rust: Requested Featured Media ID: {}", fm_id),
         None => println!("Rust: No Featured Media ID requested (was None)."),
     }
+    if let Some(slug_val) = &request.slug {
+        println!("Rust: Requested slug: {:?}", slug_val);
+    }
 
     let settings = get_project_settings(app.clone(), request.project_name.clone())
         .await?
@@ -941,6 +947,7 @@ async fn publish_to_wordpress(
         status: publish_status,
         categories: request.category_id.map(|id| vec![id]),
         featured_media: request.featured_media_id,
+        slug: request.slug.as_deref(),
     };
 
     let client = Client::new();
@@ -972,7 +979,7 @@ async fn publish_to_wordpress(
             format!(" with featured image ID {}", id)
         });
         Ok(format!(
-            "Article successfully published to WordPress with status '{}'{} {}!",
+            "Article successfully published to WordPress with status '{}'{}{}!",
             publish_status, category_msg, featured_msg
         ))
     } else {
@@ -1391,7 +1398,7 @@ Modified HTML Article with Placeholders:"#,
             }
             Err(e) => {
                 eprintln!(
-                    "Rust: Error parsing LLM response JSON: {}. Using raw response.",
+                    "Rust: Error parsing LLM response JSON: {}. Using raw response body as fallback.",
                     e
                 );
                 Ok(InsertPlaceholdersLLMResponse {
