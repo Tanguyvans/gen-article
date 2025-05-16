@@ -173,6 +173,7 @@ struct PublishRequest {
     category_id: Option<u32>,
     featured_media_id: Option<u32>,
     slug: Option<String>,
+    schedule_date: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -186,6 +187,8 @@ struct WordPressPostPayload<'a> {
     featured_media: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     slug: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    date: Option<&'a str>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -676,11 +679,25 @@ IMPORTANT: The final article content within the HTML MUST contain at least {targ
                     }
 
                     // Extract body content
-                    let body_only_html = extract_body_content(&full_html_from_llm);
+                    let mut body_only_html = extract_body_content(&full_html_from_llm);
                     println!(
                         "Rust: Body-only HTML extracted. Length: {}",
                         body_only_html.len()
                     );
+
+                    // Remove H1 tag and its content from the extracted body
+                    let h1_regex =
+                        Regex::new(r"(?is)<h1(?:[^>]*)>.*?</h1>").expect("Invalid H1 regex");
+                    if h1_regex.is_match(&body_only_html) {
+                        println!("Rust: Found H1 tag in body, removing it.");
+                        body_only_html = h1_regex.replace(&body_only_html, "").trim().to_string();
+                        println!(
+                            "Rust: Body HTML after H1 removal. New Length: {}",
+                            body_only_html.len()
+                        );
+                    } else {
+                        println!("Rust: No H1 tag found in extracted body content.");
+                    }
 
                     Ok(ArticleResponse {
                         article_text: body_only_html,
@@ -951,6 +968,13 @@ async fn publish_to_wordpress(
     if let Some(slug_val) = &request.slug {
         println!("Rust: Requested slug: {:?}", slug_val);
     }
+    if let Some(ref s_date) = request.schedule_date {
+        println!("Rust: Requested schedule date: {}", s_date);
+    }
+    println!(
+        "Rust: Requested publish status: {:?}",
+        request.publish_status
+    );
 
     let settings = get_project_settings(app.clone(), request.project_name.clone())
         .await?
@@ -990,21 +1014,35 @@ async fn publish_to_wordpress(
     );
     println!("Rust: Posting to WordPress API URL: {}", api_url);
 
-    let publish_status = request
+    let mut final_status = request
         .publish_status
         .as_deref()
         .filter(|s| ["publish", "draft", "pending"].contains(s))
         .unwrap_or("publish");
 
-    println!("Rust: Using publish status: '{}'", publish_status);
+    let mut date_to_set: Option<&str> = None;
+
+    if let Some(schedule_str) = request.schedule_date.as_deref() {
+        if !schedule_str.trim().is_empty() {
+            final_status = "future";
+            date_to_set = Some(schedule_str);
+            println!(
+                "Rust: Scheduling post. Status set to 'future', date to '{}'",
+                schedule_str
+            );
+        }
+    }
+
+    println!("Rust: Final publish status for WP API: '{}'", final_status);
 
     let post_payload = WordPressPostPayload {
         title: post_title,
         content: final_content_for_wp,
-        status: publish_status,
+        status: final_status,
         categories: request.category_id.map(|id| vec![id]),
         featured_media: request.featured_media_id,
         slug: request.slug.as_deref(),
+        date: date_to_set,
     };
 
     let client = Client::new();
@@ -1036,16 +1074,23 @@ async fn publish_to_wordpress(
             }
         }
 
-        let category_msg = request
-            .category_id
-            .map_or("".to_string(), |id| format!(" in category ID {}", id));
-        let featured_msg = request.featured_media_id.map_or("".to_string(), |id| {
-            format!(" with featured image ID {}", id)
-        });
-        Ok(format!(
-            "Article successfully published to WordPress with status '{}'{}{}!{}",
-            publish_status, category_msg, featured_msg, post_link_msg
-        ))
+        let mut success_message = format!(
+            "Article successfully processed by WordPress with status '{}'",
+            final_status
+        );
+        if let Some(d) = date_to_set {
+            success_message.push_str(&format!(" and scheduled for {}", d));
+        }
+        if let Some(cat_id) = request.category_id {
+            success_message.push_str(&format!(" in category ID {}", cat_id));
+        }
+        if let Some(fm_id) = request.featured_media_id {
+            success_message.push_str(&format!(" with featured image ID {}", fm_id));
+        }
+        success_message.push_str("!");
+        success_message.push_str(&post_link_msg);
+
+        Ok(success_message)
     } else {
         let error_text = response
             .text()

@@ -129,6 +129,9 @@ interface InsertPlaceholdersLLMResponse {
     article_with_placeholders: string;
 }
 
+// --- NEW Type for Publish Action ---
+type PublishAction = 'publishNow' | 'draft' | 'schedule';
+
 function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: ProjectPageProps) {
   // --- State ---
   const [currentSettings, setCurrentSettings] = useState<ProjectSettings | null>(null);
@@ -171,6 +174,10 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   const [isUploadingImages, setIsUploadingImages] = useState(false);
   const [isInsertingPlaceholders, setIsInsertingPlaceholders] = useState(false);
   const [selectedFeaturedMediaId, setSelectedFeaturedMediaId] = useState<number | null>(null); // NEW state for featured image
+
+  // --- NEW State for Publishing Action & Schedule Date ---
+  const [publishAction, setPublishAction] = useState<PublishAction>('publishNow');
+  const [scheduleDateTime, setScheduleDateTime] = useState<string>('');
 
   // --- ADD LOGGING INSIDE RENDER ---
   console.log("[ProjectPage Render] generatedArticle state:", generatedArticle ? generatedArticle.substring(0, 100) + "..." : generatedArticle);
@@ -692,34 +699,66 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
        }
 
        setIsPublishing(true);
-       displayFeedback("Publishing article to WordPress...", "warning");
+       
 
        try {
            const categoryIdNum = selectedWpCategoryId ? parseInt(selectedWpCategoryId, 10) : null;
-           const slugToSend = articleSlugInput.trim() || undefined; // Send undefined if empty to let WP auto-generate
+           const slugToSend = articleSlugInput.trim() || undefined; 
 
-           // --- ADD LOGGING HERE ---
+           let finalPublishStatus = "publish";
+           let finalScheduleDate: string | undefined = undefined;
+
+           if (publishAction === 'draft') {
+               finalPublishStatus = "draft";
+               displayFeedback("Saving article as draft to WordPress...", "warning");
+           } else if (publishAction === 'schedule') {
+               if (!scheduleDateTime) {
+                   displayFeedback("Please select a date and time to schedule the post.", "error");
+                   setIsPublishing(false);
+                   return;
+               }
+               // Ensure date is in the future (basic client-side check)
+               if (new Date(scheduleDateTime) <= new Date()) {
+                   displayFeedback("Schedule date must be in the future.", "error");
+                   setIsPublishing(false);
+                   return;
+               }
+               finalPublishStatus = "future"; // WordPress uses 'future' for scheduled posts
+               finalScheduleDate = new Date(scheduleDateTime).toISOString().slice(0, 19); // YYYY-MM-DDTHH:mm:ss
+               displayFeedback(`Scheduling article for ${new Date(scheduleDateTime).toLocaleString()}...`, "warning");
+           } else { // publishNow
+               displayFeedback("Publishing article to WordPress...", "warning");
+           }
+
+
            console.log("[handlePublishToWordPress] Selected Featured Media ID being sent:", selectedFeaturedMediaId);
-           console.log("[handlePublishToWordPress] Slug being sent:", slugToSend); // <-- Log slug
-           // --- END LOGGING ---
+           console.log("[handlePublishToWordPress] Slug being sent:", slugToSend); 
+           console.log("[handlePublishToWordPress] Publish Action:", publishAction);
+           console.log("[handlePublishToWordPress] Schedule DateTime:", scheduleDateTime);
+           console.log("[handlePublishToWordPress] Final Status:", finalPublishStatus);
+           console.log("[handlePublishToWordPress] Final Schedule Date:", finalScheduleDate);
 
-           // --- MODIFIED PAYLOAD to include featured_media and slug ---
+
            const requestPayload: {
                project_name: string;
                article_html: string;
+               article_title?: string; // Make sure to handle this if you allow title override
                publish_status?: string;
                category_id?: number | null;
                featured_media_id?: number | null;
-               slug?: string; // <-- ADDED slug
+               slug?: string; 
+               schedule_date?: string; // Add schedule_date to payload type
            } = {
                project_name: projectName,
                article_html: generatedArticle,
-               publish_status: "publish", // or "draft"
+               // article_title: generatedArticleTitle, // Assuming you might have a state for this
+               publish_status: finalPublishStatus,
                category_id: (categoryIdNum && !isNaN(categoryIdNum)) ? categoryIdNum : null,
                featured_media_id: selectedFeaturedMediaId,
-               slug: slugToSend, // <-- ADDED: send slug
+               slug: slugToSend, 
+               schedule_date: finalScheduleDate,
            };
-           // --- END MODIFICATION ---
+           
 
            console.log("Sending publish payload:", requestPayload);
            const successMessage = await invoke<string>("publish_to_wordpress", { request: requestPayload });
@@ -1272,14 +1311,72 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                         />
                     </div>
                     {/* --- END NEW Slug Input --- */}
+
+                    {/* --- NEW Publish Action Selection --- */}
+                    <div style={{ marginBottom: '15px' }}>
+                        <label style={{ display: 'block', marginBottom: '5px', fontWeight: 'bold' }}>Action:</label>
+                        <div style={{ display: 'flex', gap: '15px' }}>
+                            <label>
+                                <input
+                                    type="radio"
+                                    name="publishAction"
+                                    value="publishNow"
+                                    checked={publishAction === 'publishNow'}
+                                    onChange={() => setPublishAction('publishNow')}
+                                    disabled={anyLoading || isPublishing || !hasWpCredentials}
+                                /> Publish Now
+                            </label>
+                            <label>
+                                <input
+                                    type="radio"
+                                    name="publishAction"
+                                    value="draft"
+                                    checked={publishAction === 'draft'}
+                                    onChange={() => setPublishAction('draft')}
+                                    disabled={anyLoading || isPublishing || !hasWpCredentials}
+                                /> Save as Draft
+                            </label>
+                            <label>
+                                <input
+                                    type="radio"
+                                    name="publishAction"
+                                    value="schedule"
+                                    checked={publishAction === 'schedule'}
+                                    onChange={() => setPublishAction('schedule')}
+                                    disabled={anyLoading || isPublishing || !hasWpCredentials}
+                                /> Schedule
+                            </label>
+                        </div>
+                    </div>
+
+                    {publishAction === 'schedule' && (
+                        <div className="row" style={{ marginBottom: '15px', alignItems: 'center' }}>
+                            <label htmlFor="scheduleDateTime" style={{ marginRight: '10px', minWidth: '120px' }}>Schedule for:</label>
+                            <input
+                                type="datetime-local"
+                                id="scheduleDateTime"
+                                value={scheduleDateTime}
+                                onChange={(e) => setScheduleDateTime(e.target.value)}
+                                disabled={anyLoading || isPublishing || !hasWpCredentials}
+                                style={{ flexGrow: 1 }}
+                                min={new Date().toISOString().slice(0, 16)} // Prevent selecting past dates
+                            />
+                        </div>
+                    )}
+                    {/* --- END NEW Publish Action Selection --- */}
+
                     <button
                        type="button"
                        onClick={handlePublishToWordPress}
                        disabled={anyLoading || isPublishing || isInsertingPlaceholders || isLoadingWpCategories || !hasWpCredentials}
-                       title={!hasWpCredentials ? "Configure WP settings first (in Project Base Settings below)" : "Publish to WordPress"}
+                       title={!hasWpCredentials ? "Configure WP settings first (in Project Base Settings below)" : "Process Post"}
                        style={{ display: 'block', width: '100%', padding: '10px', fontSize: '1.1em', marginTop: '15px' }}
                     >
-                       {isPublishing ? 'Publishing...' : 'Publish Article to WordPress'}
+                       {isPublishing ? 'Processing...' : 
+                           publishAction === 'publishNow' ? 'Publish Now' :
+                           publishAction === 'draft' ? 'Save as Draft' :
+                           'Schedule Post'
+                       }
                     </button>
                 </div>
             </div>
