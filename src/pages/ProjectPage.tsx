@@ -181,161 +181,177 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
   // --- END LOGGING ---
 
   const fetchWpCategories = useCallback(async () => {
+    // console.log("[fetchWpCategories] Called.");
+    // console.log("[fetchWpCategories] Current settings for WP:", currentSettings?.wordpress_url, currentSettings?.wordpress_user, currentSettings?.wordpress_pass ? 'Pass_Exists' : 'Pass_Missing');
+    // console.log("[fetchWpCategories] Current selectedWpCategoryId (before fetch):", selectedWpCategoryId);
+
+
     if (!currentSettings?.wordpress_url || !currentSettings?.wordpress_user || !currentSettings?.wordpress_pass) {
+        // console.log("[fetchWpCategories] WP credentials missing. Clearing categories and selection.");
         setWpCategories([]);
-        // Don't clear selectedWpCategoryId here, let the main effect handle it if creds are invalid
+        setSelectedWpCategoryId(''); // Clear selection if creds are actively missing now
         return;
     }
     setIsLoadingWpCategories(true);
 
-    let currentSelection = selectedWpCategoryId; // Capture current selection before async
+    // It's important that selectedWpCategoryId used for validation below is the most current one.
+    // By not including it in the dependency array of this useCallback,
+    // this function's closure will always see the selectedWpCategoryId from the render it was created in.
+    // However, the useEffect that calls this IS dependent on selectedWpCategoryId changing,
+    // which might be part of the problem if it re-fetches too often.
+    // For this attempt, we rely on this function being called by an effect that has the correct dependencies.
 
     try {
         const categories = await invoke<WordPressCategory[]>("get_wordpress_categories", { projectName });
         const fetchedCategories = categories || [];
+        // console.log("[fetchWpCategories] Fetched categories:", fetchedCategories);
         setWpCategories(fetchedCategories);
+
+        // Validate the existing selectedWpCategoryId against the newly fetched categories
+        // This uses the selectedWpCategoryId from the component's state at the time of this function's execution.
+        const currentSelection = selectedWpCategoryId; // Read fresh from state
+        // console.log("[fetchWpCategories] Validating current selection:", currentSelection, "against fetched:", fetchedCategories.map(c=>c.id));
+
 
         if (fetchedCategories.length > 0) {
             const selectionStillValid = fetchedCategories.some(cat => String(cat.id) === currentSelection);
-            if (!selectionStillValid) {
-                // If the captured selection is no longer valid (e.g., category deleted from WP), clear it.
-                // Otherwise, if currentSelection was empty, it remains empty (user hasn't picked one).
-                setSelectedWpCategoryId('');
+            // console.log(`[fetchWpCategories] Is selection '${currentSelection}' still valid in fetched list? ${selectionStillValid}`);
+            if (!selectionStillValid && currentSelection !== '') {
+                // console.log(`[fetchWpCategories] Selection '${currentSelection}' no longer valid or was cleared, resetting.`);
+                setSelectedWpCategoryId(''); // Clear if the previous selection is no longer in the list
             }
-            // If selectionStillValid is true, and currentSelection had a value, it implies the UI should still reflect that.
-            // The selectedWpCategoryId state should already hold the correct value from the dropdown's onChange.
+            // If selectionStillValid is true, or currentSelection was already '', do nothing to selectedWpCategoryId here.
+            // It should have been set by the user's direct interaction with the dropdown.
         } else {
             // No categories fetched or an empty list returned
-            // displayFeedback("No categories found for the configured WordPress site...", "warning"); // Feedback might be too noisy if it's a transient issue
-            setSelectedWpCategoryId(''); // Clear selection
-            setWpCategories([]); // Ensure categories state is also empty
+            // console.log("[fetchWpCategories] No categories fetched or empty list. Clearing selection.");
+            setSelectedWpCategoryId(''); 
+            setWpCategories([]); 
         }
     } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
+        // console.error("[fetchWpCategories] Error during fetch:", errorMsg);
+        
         const isInitialLoad429 = errorMsg.includes("Status 429 Too Many Requests") && wpCategories.length === 0 && !selectedWpCategoryId;
 
         if (isInitialLoad429) {
-            console.error("Initial WP category fetch failed with 429 (feedback suppressed): ", errorMsg);
-            setWpCategories([]);
-            setSelectedWpCategoryId('');
+            // console.error("[fetchWpCategories] Initial WP category fetch failed with 429 (feedback suppressed).");
         } else {
-            console.error("Failed to fetch WP categories:", err);
-            setWpCategories([]);
-            setSelectedWpCategoryId('');
+            displayFeedback(`Error fetching WP categories: ${errorMsg}`, "error");
         }
+        setWpCategories([]);
+        setSelectedWpCategoryId('');
     } finally {
         setIsLoadingWpCategories(false);
+        // console.log("[fetchWpCategories] Finished. Final selectedWpCategoryId:", selectedWpCategoryId);
     }
   }, [
         projectName,
         currentSettings?.wordpress_url,
         currentSettings?.wordpress_user,
         currentSettings?.wordpress_pass,
+        // displayFeedback should be stable if memoized by parent, or include it if not.
+        // For now, assuming it's stable or doesn't cause issues here.
         displayFeedback,
-        // REMOVE selectedWpCategoryId from here. The function will use the state value directly.
-        // The purpose of this function is to FETCH and then VALIDATE the selection,
-        // not to re-run *because* the selection changed.
-        // The selection change is handled by the <select> onChange.
-        // Also removing wpCategories.length for previously stated reasons.
+        // selectedWpCategoryId is intentionally NOT in this dependency array.
+        // This function should be stable unless project or WP creds change.
+        // Its job is to FETCH and then VALIDATE the current selection from state.
+        // wpCategories.length is also intentionally not here.
   ]);
 
   const fetchProjectSettings = useCallback(async (name: string) => {
+        // console.log(`[fetchProjectSettings] Called for project: ${name}`);
         setIsLoadingSettings(true);
-        setSectionDefinitions([]);
+        // Reset all relevant states before loading new project data
+        setToolNameInput("");
         setArticleGoalPromptInput("");
         setExampleUrlInput("");
-        setToolNameInput("");
+        setSectionDefinitions([]);
         setTextModelInput(DEFAULT_TEXT_MODEL);
         setWordCountInput(String(DEFAULT_WORD_COUNT));
         setGeneratedArticle(null);
         setSuggestedPrompts(null);
         setEditedPrompts({});
+        setPromptAltTexts({});
         setImageGenResults({});
         setIsGeneratingImage({});
         setPromptAspectRatios({});
         setSelectedImageIndices(new Set());
         setIsUploadingImages(false);
-        
-        // Clear these before loading new project settings.
-        // The useEffect for categories will trigger a fetch if new settings have valid WP creds.
-        setWpCategories([]); 
-        setSelectedWpCategoryId('');
-        setIsLoadingWpCategories(false);
+        setIsInsertingPlaceholders(false);
+        setSelectedFeaturedMediaId(null);
         setArticleSlugInput('');
         
+        // Crucially, reset WP category states here before new settings might trigger a fetch
+        setWpCategories([]); 
+        setSelectedWpCategoryId('');
+        setIsLoadingWpCategories(false); // Ensure loading indicator for categories is also reset
+        
         try {
-            const settings = await invoke<ProjectSettings | null>(
-                "get_project_settings", { name: name }
-            );
+            const settings = await invoke<ProjectSettings | null>("get_project_settings", { name });
+            // console.log(`[fetchProjectSettings] Settings received for ${name}:`, settings);
             if (settings) {
-                setCurrentSettings(settings); // This will trigger the category fetch useEffect if WP creds are valid
+                setCurrentSettings(settings); // This is the key: setting this will trigger the other useEffect for categories
                 setToolNameInput(settings.toolName || name);
                 setArticleGoalPromptInput(settings.article_goal_prompt || "");
                 setExampleUrlInput(settings.example_url || "");
-                setTextModelInput(settings.text_generation_model as TextModel || DEFAULT_TEXT_MODEL);
+                setTextModelInput((settings.text_generation_model as TextModel) || DEFAULT_TEXT_MODEL);
                 setWordCountInput(String(settings.target_word_count || DEFAULT_WORD_COUNT));
 
                 if (settings.sections && settings.sections.length > 0) {
-                    const loadedSections = settings.sections.map(secData => ({
-                        ...secData,
-                        id: getNewSectionId(),
-                    }));
-                    setSectionDefinitions(loadedSections);
+                    setSectionDefinitions(settings.sections.map(secData => ({ ...secData, id: getNewSectionId() })));
                 } else {
-                    setSectionDefinitions([
-                        { id: getNewSectionId(), instructions: "Write an engaging introduction for [Tool Name]..." }
-                    ]);
+                    setSectionDefinitions([{ id: getNewSectionId(), instructions: "Write an engaging introduction for [Tool Name]..." }]);
                 }
             } else {
-                 setCurrentSettings({
+                // console.log(`[fetchProjectSettings] No settings found for ${name}, creating defaults.`);
+                const defaultNewSettings: ProjectSettings = {
                      wordpress_url: "", wordpress_user: "", wordpress_pass: "",
                      toolName: name, article_goal_prompt: "", example_url: "", sections: [],
                      text_generation_model: DEFAULT_TEXT_MODEL, target_word_count: DEFAULT_WORD_COUNT
-                 });
+                 };
+                 setCurrentSettings(defaultNewSettings);
                  setToolNameInput(name);
-                 setTextModelInput(DEFAULT_TEXT_MODEL);
-                 setWordCountInput(String(DEFAULT_WORD_COUNT));
-                 setSectionDefinitions([
-                     { id: getNewSectionId(), instructions: "Write an engaging introduction for [Tool Name]..." }
-                 ]);
+                 // Other fields remain at their reset defaults
                  displayFeedback(`Created default settings for new project ${name}.`, "success");
             }
         } catch (err) {
-            console.error("Failed to fetch project settings:", err);
+            // console.error(`[fetchProjectSettings] Error fetching settings for ${name}:`, err);
             displayFeedback(`Error fetching settings for ${name}: ${err}`, "error");
-            setCurrentSettings(null); 
-            setTextModelInput(DEFAULT_TEXT_MODEL);
-            setWordCountInput(String(DEFAULT_WORD_COUNT));
-            setSectionDefinitions([
-                 { id: getNewSectionId(), instructions: "Error loading sections..." }
-            ]);
+            setCurrentSettings(null); // Clear settings on error
+            // Reset other dependent states to sensible defaults
+            setToolNameInput(name); // Keep project name at least
+            setSectionDefinitions([{ id: getNewSectionId(), instructions: "Error loading sections..." }]);
         } finally {
             setIsLoadingSettings(false);
+            // console.log(`[fetchProjectSettings] Finished for project: ${name}`);
         }
-    }, [projectName, displayFeedback]);
+    }, [projectName, displayFeedback]); // displayFeedback is a prop, assume stable or correctly memoized by parent
 
   useEffect(() => {
+    // console.log(`[useEffect projectChange] Project name changed to: ${projectName}. Resetting sectionId and calling fetchProjectSettings.`);
     nextSectionId = 1; 
     fetchProjectSettings(projectName);
-  }, [projectName, fetchProjectSettings]);
+  }, [projectName, fetchProjectSettings]); // fetchProjectSettings is memoized
 
    useEffect(() => {
+    // console.log(`[useEffect categoryTrigger] Running. isLoadingSettings: ${isLoadingSettings}, WP URL: ${currentSettings?.wordpress_url}`);
      if (!isLoadingSettings && currentSettings?.wordpress_url && currentSettings?.wordpress_user && currentSettings?.wordpress_pass) {
-        // WP credentials are valid and settings are loaded, fetch categories.
+        // console.log("[useEffect categoryTrigger] Valid credentials and settings loaded. Calling fetchWpCategories.");
         fetchWpCategories();
      } else if (!isLoadingSettings) { 
-        // Settings loaded, but WP credentials are NOT valid. Clear category state.
+        // console.log("[useEffect categoryTrigger] Settings loaded, but WP credentials invalid/missing. Clearing category state.");
         setWpCategories([]);
         setSelectedWpCategoryId('');
-        setIsLoadingWpCategories(false); // Ensure this is reset too
+        setIsLoadingWpCategories(false); 
      }
-     // This effect depends on WP credentials changing or initial settings load finishing.
+     // This effect should ONLY run if the WP credentials change or when settings initially load.
    }, [
         currentSettings?.wordpress_url,
         currentSettings?.wordpress_user,
         currentSettings?.wordpress_pass,
-        isLoadingSettings, // Re-run when loading finishes to check credentials
-        fetchWpCategories // fetchWpCategories is memoized and its deps are project/creds/displayFeedback
+        isLoadingSettings, 
+        fetchWpCategories // fetchWpCategories is memoized (depends on projectName, WP creds, displayFeedback)
     ]);
 
   // --- Save Handlers ---
@@ -1212,20 +1228,29 @@ function ProjectPage({ projectName, displayFeedback, onBack, onDelete }: Project
                        <select
                            id="wpCategory"
                            value={selectedWpCategoryId}
-                           onChange={(e) => setSelectedWpCategoryId(e.target.value)}
-                           disabled={anyLoading || isPublishing || wpCategories.length === 0 || !hasWpCredentials}
+                           onChange={(e) => {
+                               console.log(`[Category Select onChange] User selected: ${e.target.value}. Previous state: ${selectedWpCategoryId}`);
+                               setSelectedWpCategoryId(e.target.value);
+                           }}
+                           disabled={anyLoading || isPublishing || !hasWpCredentials || isLoadingWpCategories}
                            style={{ flexGrow: 1 }}
                        >
                            <option value="">-- Select Category (Optional) --</option>
                            {isLoadingWpCategories && <option value="" disabled>Loading categories...</option>}
+                           {!isLoadingWpCategories && wpCategories.length === 0 && (
+                               <option value="" disabled>No categories available</option>
+                           )}
                            {wpCategories.map(cat => (
                                <option key={cat.id} value={String(cat.id)}>{cat.name}</option>
                            ))}
                        </select>
                        <button
                            type="button"
-                           onClick={fetchWpCategories}
-                           disabled={anyLoading || isPublishing || !hasWpCredentials}
+                           onClick={() => {
+                               console.log("[Refresh Categories Button] Clicked.");
+                               fetchWpCategories(); // Directly call the memoized fetch function
+                           }}
+                           disabled={anyLoading || isPublishing || !hasWpCredentials || isLoadingWpCategories}
                            style={{ marginLeft: '10px', padding: '0.4em 0.8em' }}
                            title="Refresh Category List"
                        >

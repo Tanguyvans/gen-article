@@ -55,6 +55,7 @@ struct ArticleRequest {
 #[derive(Serialize, Debug)]
 struct ArticleResponse {
     article_text: String,
+    title: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -167,6 +168,7 @@ struct SuggestImagePromptsResponse {
 struct PublishRequest {
     project_name: String,
     article_html: String,
+    article_title: Option<String>,
     publish_status: Option<String>,
     category_id: Option<u32>,
     featured_media_id: Option<u32>,
@@ -653,9 +655,36 @@ IMPORTANT: The final article content within the HTML MUST contain at least {targ
         match serde_json::from_str::<OpenAiApiResponse>(&response_body_text) {
             Ok(parsed_response) => {
                 if let Some(choice) = parsed_response.choices.get(0) {
-                    println!("Successfully parsed response and extracted content.");
+                    let full_html_from_llm = choice.message.content.clone();
+                    println!(
+                        "Rust: Full HTML from LLM received. Length: {}",
+                        full_html_from_llm.len()
+                    );
+
+                    // Extract title
+                    let title_regex =
+                        Regex::new(r"(?i)<title>(.*?)</title>").expect("Invalid title regex");
+                    let extracted_title = title_regex
+                        .captures(&full_html_from_llm)
+                        .and_then(|caps| caps.get(1))
+                        .map(|m| m.as_str().trim().to_string());
+
+                    if let Some(ref title) = extracted_title {
+                        println!("Rust: Extracted title: {}", title);
+                    } else {
+                        println!("Rust: No <title> tag found in LLM response.");
+                    }
+
+                    // Extract body content
+                    let body_only_html = extract_body_content(&full_html_from_llm);
+                    println!(
+                        "Rust: Body-only HTML extracted. Length: {}",
+                        body_only_html.len()
+                    );
+
                     Ok(ArticleResponse {
-                        article_text: choice.message.content.clone(),
+                        article_text: body_only_html,
+                        title: extracted_title,
                     })
                 } else {
                     println!("OpenAI response successful but 'choices' array is empty.");
@@ -881,6 +910,28 @@ async fn get_wordpress_categories(
     }
 }
 
+fn extract_body_content(html: &str) -> String {
+    println!(
+        "Rust: Full HTML input to extract_body_content (length {}): [FIRST 200 CHARS]{}[END_SNIPPET]",
+        html.len(),
+        html.chars().take(200).collect::<String>()
+    );
+    let body_regex = Regex::new(r"(?is)<body(?:[^>]*)>(.*?)</body>").expect("Invalid body regex");
+
+    if let Some(caps) = body_regex.captures(html) {
+        if let Some(content_match) = caps.get(1) {
+            println!("Rust: Extracted content from <body> tag.");
+            return content_match.as_str().trim().to_string();
+        } else {
+            println!("Rust: <body> tag matched but no content group found. Returning empty string from body.");
+            return String::new();
+        }
+    } else {
+        println!("Rust: <body> tag not found. Returning empty string as body content is specifically requested.");
+        return String::new();
+    }
+}
+
 #[tauri::command]
 async fn publish_to_wordpress(
     app: tauri::AppHandle,
@@ -915,17 +966,23 @@ async fn publish_to_wordpress(
         return Err("WordPress Application Password is not configured.".to_string());
     }
 
-    let title_regex = Regex::new(r"(?i)<title>(.*?)</title>")
-        .map_err(|e| format!("Failed to compile title regex: {}", e))?;
     let default_title = format!("Generated Article for {}", settings.tool_name);
-    let post_title = title_regex
-        .captures(&request.article_html)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().trim())
-        .filter(|s| !s.is_empty())
+    let post_title = request
+        .article_title
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
         .unwrap_or(&default_title);
 
     println!("Rust: Using post title: '{}'", post_title);
+
+    let final_content_for_wp = request.article_html.trim();
+    println!(
+        "Rust: Content for WordPress (already body-only). Length: {}",
+        final_content_for_wp.len()
+    );
+    if final_content_for_wp.is_empty() {
+        println!("Rust: Warning - content for WordPress is empty after processing.");
+    }
 
     let api_url = format!(
         "{}/wp-json/wp/v2/posts",
@@ -943,7 +1000,7 @@ async fn publish_to_wordpress(
 
     let post_payload = WordPressPostPayload {
         title: post_title,
-        content: &request.article_html,
+        content: final_content_for_wp,
         status: publish_status,
         categories: request.category_id.map(|id| vec![id]),
         featured_media: request.featured_media_id,
@@ -972,6 +1029,13 @@ async fn publish_to_wordpress(
     if status.is_success() || status.as_u16() == 201 {
         let response_text = response.text().await.unwrap_or_default();
         println!("Rust: WordPress API Success Response: {}", response_text);
+        let mut post_link_msg = "".to_string();
+        if let Ok(json_response) = serde_json::from_str::<serde_json::Value>(&response_text) {
+            if let Some(link) = json_response.get("link").and_then(|v| v.as_str()) {
+                post_link_msg = format!(" View post: {}", link);
+            }
+        }
+
         let category_msg = request
             .category_id
             .map_or("".to_string(), |id| format!(" in category ID {}", id));
@@ -979,8 +1043,8 @@ async fn publish_to_wordpress(
             format!(" with featured image ID {}", id)
         });
         Ok(format!(
-            "Article successfully published to WordPress with status '{}'{}{}!",
-            publish_status, category_msg, featured_msg
+            "Article successfully published to WordPress with status '{}'{}{}!{}",
+            publish_status, category_msg, featured_msg, post_link_msg
         ))
     } else {
         let error_text = response
